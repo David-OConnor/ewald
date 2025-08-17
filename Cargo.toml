@@ -1,0 +1,30 @@
+[package]
+name = "ewald"
+version = "0.1.0"
+edition = "2024"
+authors = ["David O'Connor <the_alchemist@fastmail.com>"]
+description = "Fast n-body simluation using the Barnes Hut algorithm"
+keywords = ["n-body", "cosmology", "chemistry", "barnes"]
+categories = [
+    "algorithms",
+    "mathematics",
+    "science",
+    "algorithms",
+]
+repository = "https://github.com/David-OConnor/barnes_hut"
+documentation = "https://docs.rs/barnes_hut"
+readme = "README.md"
+license = "MIT"
+exclude = [".gitignore"]
+
+
+[dependencies]
+lin_alg = "1.0.6"
+# We use this to get the erf error function for use in the Ewald approximation in MD
+# todo: Way to avoid this dep for something lighter?
+statrs = "0.18.0"
+rustfft = "6.4.0" # For long range reciprical forces
+
+
+[features]
+cuda = ["lin_alg/cuda"]
