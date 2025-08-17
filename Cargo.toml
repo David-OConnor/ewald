@@ -3,16 +3,16 @@ name = "ewald"
 version = "0.1.0"
 edition = "2024"
 authors = ["David O'Connor <the_alchemist@fastmail.com>"]
-description = "Fast n-body simluation using the Barnes Hut algorithm"
-keywords = ["n-body", "cosmology", "chemistry", "barnes"]
+description = "Ewald SPME force calculations"
+keywords = ["n-body", "biology", "chemistry", "barnes", "dynamics"]
 categories = [
     "algorithms",
     "mathematics",
     "science",
     "algorithms",
 ]
-repository = "https://github.com/David-OConnor/barnes_hut"
-documentation = "https://docs.rs/barnes_hut"
+repository = "https://github.com/David-OConnor/ewald"
+documentation = "https://docs.rs/ewald"
 readme = "README.md"
 license = "MIT"
 exclude = [".gitignore"]

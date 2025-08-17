@@ -2,6 +2,8 @@
 //! We use this to handle periodic boundary conditions properly, which we use to take the
 //! water molecules into account.
 
+// todo: f32 support / generic floats
+
 use std::f64::consts::{FRAC_2_SQRT_PI, PI, TAU};
 
 // todo: This may be a good candidate for a standalone library.
@@ -13,27 +15,10 @@ use statrs::function::erf::{erf, erfc};
 
 // use crate::dynamics::{AtomDynamics, MdState, ambient::SimBox, non_bonded::SCALE_COUL_14};
 
-// Ewald SPME approximation for Coulomb force
 
-// Above this distance when calculating Coulomb forces, use the long-range Ewald approximation.
-// const EWALD_CUTOFF: f64 = 10.0; // Å. 9-10 is common.
-// const EWALD_CUTOFF_SQ: f64 = EWALD_CUTOFF * EWALD_CUTOFF;
-
-// Instead of a hard cutoff between short and long-range forces, these
-// parameters control a smooth taper.
-// todo: I believe our neighbor list must use the same cutoff as this, so we use it directly.
-const LONG_RANGE_SWITCH_START: f64 = 8.0; // start switching (Å)
-pub const LONG_RANGE_CUTOFF: f64 = 10.0;
-
-// A bigger α means more damping, and a smaller real-space contribution. (Cheaper real), but larger
-// reciprocal load.
-// Common rule for α: erfc(α r_c) ≲ 10⁻⁴…10⁻⁵
-const EWALD_ALPHA: f64 = 0.35; // Å^-1. 0.35 is good for cutoff = 10.
 
 const SQRT_PI: f64 = 1.7724538509055159;
-pub const PME_MESH_SPACING: f64 = 1.0;
-// SPME order‑4 B‑spline interpolation
-const SPLINE_ORDER: usize = 4;
+
 
 // todo: How and where are you setting the cutoff? (e.g. of 10Å, between real and long-range Ewald)
 
@@ -52,13 +37,11 @@ fn taper(s: f64) -> (f64, f64) {
 }
 
 /// This assumes the tapering has been applied outside.
-fn force_coulomb_ewald_real_inner(dir: Vec3, r: f64, qi: f64, qj: f64) -> Vec3 {
+fn force_coulomb_ewald_real_inner(dir: Vec3, r: f64, qi: f64, qj: f64, α: f64) -> Vec3 {
     // F = q_i q_j [ erfc(αr)/r² + 2α/√π · e^(−α²r²)/r ]  · 4πϵ0⁻¹  · r̂
     let qfac = qi * qj;
     let inv_r = 1.0 / r;
     let inv_r2 = inv_r * inv_r;
-
-    const α: f64 = EWALD_ALPHA;
 
     let α_r = α * r;
     let erfc_term = erfc(α_r);
@@ -69,22 +52,23 @@ fn force_coulomb_ewald_real_inner(dir: Vec3, r: f64, qi: f64, qj: f64) -> Vec3 {
 }
 
 /// We use this for short-range Coulomb forces, as part of SPME.
-pub fn force_coulomb_ewald_real(dir: Vec3, r: f64, qi: f64, qj: f64) -> Vec3 {
+/// `lr_switch` is (start, cutoff).
+pub fn force_coulomb_ewald_real(dir: Vec3, r: f64, qi: f64, qj: f64, lr_switch: (f64, f64), α: f64) -> Vec3 {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
-    if r >= LONG_RANGE_CUTOFF {
+    if r >= lr_switch.1 {
         return Vec3::new_zero();
     }
 
-    let f = force_coulomb_ewald_real_inner(dir, r, qi, qj);
+    let f = force_coulomb_ewald_real_inner(dir, r, qi, qj, α);
 
     // Inside the taper region, return the short-range force.
-    if r <= LONG_RANGE_SWITCH_START {
+    if r <= lr_switch.0 {
         return f;
     }
 
     // Apply switch to the potential; to approximate on the force, multiply by S and add -U*dS/dr*r̂
     // For brevity, a common practical shortcut is scaling force by S(r):
-    let s = (r - LONG_RANGE_SWITCH_START) / (LONG_RANGE_CUTOFF - LONG_RANGE_SWITCH_START);
+    let s = (r - lr_switch.0) / (lr_switch.1 - lr_switch.0);
     let (S, _dSds) = taper(s);
     f * S
 }
