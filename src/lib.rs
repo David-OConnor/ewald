@@ -1,4 +1,4 @@
-//! For Smooth-Particle-Mesh_Ewald; a standard approximation for Coulomb forces in MD.
+//! For Smooth-Particle-Mesh Ewald; a standard approximation for Coulomb forces in MD.
 //! We use this to handle periodic boundary conditions properly, which we use to take the
 //! water molecules into account.
 
