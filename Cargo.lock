@@ -42,6 +42,7 @@ dependencies = [
 name = "ewald"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "lin_alg",
  "rustfft",
  "statrs",
