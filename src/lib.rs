@@ -21,6 +21,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
 const SQRT_PI: f64 = 1.7724538509055159;
+const INV_SQRT_PI: f64 = 1. / SQRT_PI;
 
 const SPLINE_ORDER: usize = 4;
 
@@ -419,41 +420,35 @@ fn _taper(s: f64) -> (f64, f64) {
 }
 
 /// We use this for short-range Coulomb forces, as part of SPME.
-/// This assumes the tapering or cutoff has been applied outside.
-fn force_coulomb_short_range_inner(dir: Vec3, r: f64, qi: f64, qj: f64, α: f64) -> Vec3 {
-    // F = q_i q_j [ erfc(αr)/r² + 2α/√π · e^(−α²r²)/r ]  · 4πϵ0⁻¹  · r̂
-    let qfac = qi * qj;
-    let inv_r = 1.0 / r;
-    let inv_r2 = inv_r * inv_r;
-
-    let α_r = α * r;
-    let erfc_term = erfc(α_r);
-    let exp_term = (-α_r * α_r).exp();
-    let force_mag = qfac * (erfc_term * inv_r2 + 2.0 * α * exp_term / (SQRT_PI * r));
-
-    dir * force_mag
-}
-
-/// We use this for short-range Coulomb forces, as part of SPME.
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
 /// forces.
-/// `α`
+/// This assumes diff (and dir) is in order tgt - src.
 pub fn force_coulomb_short_range(
     dir: Vec3,
-    r: f64,
-    qi: f64,
-    qj: f64,
+    dist: f64,
+    // Included to share between this and LJ.
+    inv_dist: f64,
+    inv_dist_sq: f64,
+    q_0: f64,
+    q_1: f64,
     // lr_switch: (f64, f64),
     cutoff_dist: f64,
     α: f64,
 ) -> Vec3 {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
     // if r >= lr_switch.1 {
-    if r > cutoff_dist {
+    if dist > cutoff_dist {
         return Vec3::new_zero();
     }
 
-    force_coulomb_short_range_inner(dir, r, qi, qj, α)
+    let α_r = α * dist;
+    let erfc_term = erfc(α_r);
+    let exp_term = (-α_r * α_r).exp();
+
+    let force_mag =
+        q_0 * q_1 * (erfc_term * inv_dist_sq + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
+
+    dir * force_mag
 
     // let f = force_coulomb_short_range_inner(dir, r, qi, qj, α);
     // // Inside the taper region, return the short-range force.
@@ -489,8 +484,8 @@ pub fn force_coulomb_ewald_real_x8(
     // let exp_term = f64x8::splat(E).pow(-alpha * alpha * r * r);
     let exp_term = f64x8::splat(1.); // todo temp
 
-    let force_mag = qfac
-        * (erfc_term * inv_r2 + f64x8::splat(2.) * α * exp_term / (f64x8::splat(SQRT_PI) * r));
+    let force_mag =
+        qfac * (erfc_term * inv_r2 + f64x8::splat(2.) * α * exp_term / (f64x8::splat(SQRT_PI) * r));
 
     dir * force_mag
 }
@@ -503,6 +498,6 @@ pub fn ewald_comp_force(dir: Vec3, r: f64, qi: f64, qj: f64, alpha: f64) -> Vec3
     let inv_r2 = inv_r * inv_r;
 
     let ar = alpha * r;
-    let fmag = qfac * (erf(ar) * inv_r2 - (2.0 * alpha / SQRT_PI) * (-ar * ar).exp() * inv_r);
+    let fmag = qfac * (erf(ar) * inv_r2 - (2.0 * alpha * INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     dir * fmag
 }
