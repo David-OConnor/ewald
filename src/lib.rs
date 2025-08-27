@@ -18,9 +18,8 @@ use std::{
     time::Instant,
 };
 
-use cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg, sys::CUstream};
+use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg, sys::CUstream, DevicePtr};
 // todo: This may be a good candidate for a standalone library.
 use lin_alg::f64::Vec3;
 #[cfg(target_arch = "x86_64")]
@@ -238,7 +237,7 @@ impl PmeRecip {
         // println!("SPME A: {} us", elapsed.as_micros());
 
         // Note: These FFTs are the biggest time bottleneck.
-        let start = Instant::now();
+        // let start = Instant::now();
         // Inverse FFT to real-space E grids
         fft3_inplace(
             &mut exk,
@@ -258,8 +257,8 @@ impl PmeRecip {
             &mut self.planner,
             false,
         );
-        let elapsed = start.elapsed();
-        println!("SPME B: {} us", elapsed.as_micros());
+        // let elapsed = start.elapsed();
+        // println!("SPME B: {} us", elapsed.as_micros());
 
         // let start = Instant::now();
         let result = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
@@ -272,7 +271,10 @@ impl PmeRecip {
 
     #[cfg(feature = "cuda")]
     /// Compute reciprocal-space forces. Positions must be in the primary box [0,L) per axis.
-    /// Note that this only uses GPU for the FF3 part, but this is dominates computation time.
+    /// Note that this only uses GPU for the FFT part, but this is dominates computation time.
+    ///
+    /// This isn't calling a custom CUDA kernel, to iterate over an array, It leverages host-side
+    /// CUDA code, which calls cuFFT.
     pub fn forces_gpu(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -285,6 +287,7 @@ impl PmeRecip {
         let mut rho = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
         self.spread_charges(pos, q, &mut rho);
 
+        let start = Instant::now();
         fft3_inplace(
             &mut rho,
             (self.nx, self.ny, self.nz),
@@ -292,16 +295,26 @@ impl PmeRecip {
             true,
         );
 
+        let elapsed = start.elapsed();
+        println!("SPME FFT A: {} ms", elapsed.as_millis());
+
         let (mut exk, mut eyk, mut ezk) = self.forces_part_b(&rho, n_pts);
 
-        // let elapsed = start.elapsed();
-        // println!("SPME recip A: {} ms", elapsed.as_millis());
+        let mut exk_test = exk.clone();
+        // todo temp. Note: The tests disagree, and the CPU version is reporting 0s?
+        fft3_inplace(
+            &mut exk_test,
+            (self.nx, self.ny, self.nz),
+            &mut self.planner,
+            false,
+        );
 
+        let start = Instant::now();
         // Run the inverse FFTs on the GPU.
         {
-            let mut exk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&exk)).unwrap();
-            let mut eyk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&eyk)).unwrap();
-            let mut ezk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&ezk)).unwrap();
+            let exk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&exk)).unwrap();
+            let eyk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&eyk)).unwrap();
+            let ezk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&ezk)).unwrap();
 
             // Get raw CUdeviceptrs tied to this stream.
             // IMPORTANT: keep the guards alive until after the FFI call returns.
@@ -312,20 +325,6 @@ impl PmeRecip {
             let nx = exk.len();
             let ny = eyk.len();
             let nz = ezk.len();
-
-            // let kernel = module.load_function("nonbonded_force_kernel").unwrap();
-            // let cfg = LaunchConfig::for_num_elems(exk.len() as u32); // todo: What should this be?
-            // let mut launch_args = stream.launch_builder(&kernel);
-            //
-            // launch_args.arg(&mut exk_gpu);
-            // launch_args.arg(&mut eyk_gpu);
-            // launch_args.arg(&mut ezk_gpu);
-            // //
-            // launch_args.arg(&nx);
-            // launch_args.arg(&ny);
-            // launch_args.arg(&nz);
-            //
-            // unsafe { launch_args.launch(cfg) }.unwrap();
 
             // Call the cuFFT wrapper (still runs on GPU; invoked from host)
             unsafe {
@@ -344,25 +343,12 @@ impl PmeRecip {
             ezk = unflatten_cplx_vec(&stream.memcpy_dtov(&ezk_gpu).unwrap());
         }
 
-        // Inverse FFT to real-space E grids
-        fft3_inplace(
-            &mut exk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut eyk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut ezk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
+        // todo temp. And, this test is... showing 0 for the CPU values?
+        println!("CPU: {:.4?}", &exk_test[0..10]);
+        println!("GPU : {:.4?}", &exk[0..10]);
+
+        let elapsed = start.elapsed();
+        println!("SPME FFT B: {} ms", elapsed.as_millis());
 
         // let start = Instant::now();
         let result = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
@@ -577,6 +563,7 @@ fn _taper(s: f64) -> (f64, f64) {
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
 /// forces.
 /// This assumes diff (and dir) is in order tgt - src.
+/// Also returns potential energy.
 pub fn force_coulomb_short_range(
     dir: Vec3,
     dist: f64,
@@ -588,23 +575,27 @@ pub fn force_coulomb_short_range(
     // lr_switch: (f64, f64),
     cutoff_dist: f64,
     α: f64,
-) -> Vec3 {
+) -> (Vec3, f64) {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
     // if r >= lr_switch.1 {
     if dist > cutoff_dist {
-        return Vec3::new_zero();
+        return (Vec3::new_zero(), 0.);
     }
 
     let α_r = α * dist;
     let erfc_term = erfc(α_r);
+    let charge_term = q_0 * q_1;
+
+    let energy = charge_term * inv_dist * erfc_term;
+
     let exp_term = (-α_r * α_r).exp();
 
     let force_mag =
-        q_0 * q_1 * (erfc_term * inv_dist_sq + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
+        charge_term * (erfc_term * inv_dist_sq + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
 
-    dir * force_mag
+    (dir * force_mag, energy)
 
-    // let f = force_coulomb_short_range_inner(dir, r, qi, qj, α);
+    // Removed taper code.
     // // Inside the taper region, return the short-range force.
     // if r <= lr_switch.0 {
     //     return f;
@@ -680,8 +671,8 @@ fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f64>> {
 }
 
 // todo: Experimenting
-#[link(name = "spme_fft")] // whatever your .cu builds to
 unsafe extern "C" {
+    // The CUDA function name must match this.
     fn spme_inverse_ffts_3_c2c(
         exk: *mut std::ffi::c_void,
         eyk: *mut std::ffi::c_void,

@@ -15,6 +15,8 @@ instead.
 Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), and CUDA (via CUDARC) are planned. For now, you may wish to write
 custom GPU kernels, using this lib as a reference.
 
+WIP code for using the SPME/recip interaction on GPU.
+
 Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus).
 
 Here's an example of use:
