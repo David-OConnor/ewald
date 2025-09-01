@@ -19,7 +19,9 @@ use std::{
 };
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg, sys::CUstream, DevicePtr};
+use cudarc::driver::{
+    CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, sys::CUstream,
+};
 // todo: This may be a good candidate for a standalone library.
 use lin_alg::f64::Vec3;
 #[cfg(target_arch = "x86_64")]
@@ -33,6 +35,7 @@ const INV_SQRT_PI: f64 = 1. / SQRT_PI;
 
 const SPLINE_ORDER: usize = 4;
 
+/// Initialize this once for the application, or once per step.
 pub struct PmeRecip {
     nx: usize,
     ny: usize,
@@ -218,12 +221,13 @@ impl PmeRecip {
             .collect()
     }
 
-    /// Compute reciprocal-space forces. Positions must be in the primary box [0,L) per axis.
-    pub fn forces(&mut self, pos: &[Vec3], q: &[f64]) -> Vec<Vec3> {
-        assert_eq!(pos.len(), q.len());
+    /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
+    pub fn forces(&mut self, posits: &[Vec3], q: &[f64]) -> Vec<Vec3> {
+        assert_eq!(posits.len(), q.len());
+
         let n_pts = self.nx * self.ny * self.nz;
         let mut rho = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
-        self.spread_charges(pos, q, &mut rho);
+        self.spread_charges(posits, q, &mut rho);
 
         fft3_inplace(
             &mut rho,
@@ -261,7 +265,7 @@ impl PmeRecip {
         // println!("SPME B: {} us", elapsed.as_micros());
 
         // let start = Instant::now();
-        let result = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
+        let result = self.forces_part_c(posits, &exk, &eyk, &ezk, q);
 
         // let elapsed = start.elapsed();
         // println!("SPME C: {} us", elapsed.as_micros());
@@ -561,15 +565,15 @@ fn _taper(s: f64) -> (f64, f64) {
 
 /// We use this for short-range Coulomb forces, as part of SPME.
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
-/// forces.
+/// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å.
+///
 /// This assumes diff (and dir) is in order tgt - src.
 /// Also returns potential energy.
 pub fn force_coulomb_short_range(
     dir: Vec3,
     dist: f64,
-    // Included to share between this and LJ.
+    // Included to share between this and Lennard Jones.
     inv_dist: f64,
-    inv_dist_sq: f64,
     q_0: f64,
     q_1: f64,
     // lr_switch: (f64, f64),
@@ -590,8 +594,8 @@ pub fn force_coulomb_short_range(
 
     let exp_term = (-α_r * α_r).exp();
 
-    let force_mag =
-        charge_term * (erfc_term * inv_dist_sq + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
+    let force_mag = charge_term
+        * (erfc_term * inv_dist * inv_dist + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
 
     (dir * force_mag, energy)
 
@@ -608,32 +612,32 @@ pub fn force_coulomb_short_range(
     // f * S
 }
 
-// todo: Update this to reflect your changes to the algo above that apply tapering.
-pub fn force_coulomb_ewald_real_x8(
-    dir: Vec3x8,
-    r: f64x8,
-    qi: f64x8,
-    qj: f64x8,
-    α: f64x8,
-) -> Vec3x8 {
-    // F = q_i q_j [ erfc(αr)/r² + 2α/√π · e^(−α²r²)/r ]  · 4πϵ0⁻¹  · r̂
-    let qfac = qi * qj;
-    let inv_r = f64x8::splat(1.) / r;
-    let inv_r2 = inv_r * inv_r;
-
-    // let erfc_term = erfc(alpha * r);
-    let erfc_term = f64x8::splat(0.); // todo temp: Figure how how to do erfc with SIMD.
-
-    // todo: Figure out how to do exp with SIMD. Probably need powf in lin_alg
-    // let exp_term = (-alpha * alpha * r * r).exp();
-    // let exp_term = f64x8::splat(E).pow(-alpha * alpha * r * r);
-    let exp_term = f64x8::splat(1.); // todo temp
-
-    let force_mag =
-        qfac * (erfc_term * inv_r2 + f64x8::splat(2.) * α * exp_term / (f64x8::splat(SQRT_PI) * r));
-
-    dir * force_mag
-}
+// // todo: Update this to reflect your changes to the algo above that apply tapering.
+// pub fn force_coulomb_ewald_real_x8(
+//     dir: Vec3x8,
+//     r: f64x8,
+//     qi: f64x8,
+//     qj: f64x8,
+//     α: f64x8,
+// ) -> Vec3x8 {
+//     // F = q_i q_j [ erfc(αr)/r² + 2α/√π · e^(−α²r²)/r ]  · 4πϵ0⁻¹  · r̂
+//     let qfac = qi * qj;
+//     let inv_r = f64x8::splat(1.) / r;
+//     let inv_r2 = inv_r * inv_r;
+//
+//     // let erfc_term = erfc(alpha * r);
+//     let erfc_term = f64x8::splat(0.); // todo temp: Figure how how to do erfc with SIMD.
+//
+//     // todo: Figure out how to do exp with SIMD. Probably need powf in lin_alg
+//     // let exp_term = (-alpha * alpha * r * r).exp();
+//     // let exp_term = f64x8::splat(E).pow(-alpha * alpha * r * r);
+//     let exp_term = f64x8::splat(1.); // todo temp
+//
+//     let force_mag =
+//         qfac * (erfc_term * inv_r2 + f64x8::splat(2.) * α * exp_term / (f64x8::splat(SQRT_PI) * r));
+//
+//     dir * force_mag
+// }
 
 /// Useful for scaling corrections, e.g. 1-4 exclusions in AMBER.
 pub fn ewald_comp_force(dir: Vec3, r: f64, qi: f64, qj: f64, alpha: f64) -> Vec3 {
@@ -647,6 +651,7 @@ pub fn ewald_comp_force(dir: Vec3, r: f64, qi: f64, qj: f64, alpha: f64) -> Vec3
     dir * fmag
 }
 
+#[cfg(feature = "cuda")]
 /// For CUDA serialization
 fn flatten_cplx_vec(v: &[Complex<f64>]) -> Vec<f32> {
     let mut result = Vec::with_capacity(v.len() * 2);
@@ -659,6 +664,7 @@ fn flatten_cplx_vec(v: &[Complex<f64>]) -> Vec<f32> {
     result
 }
 
+#[cfg(feature = "cuda")]
 /// For CUDA deserialization
 fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f64>> {
     let mut result = Vec::with_capacity(v.len() / 2);
@@ -670,7 +676,7 @@ fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f64>> {
     result
 }
 
-// todo: Experimenting
+#[cfg(feature = "cuda")]
 unsafe extern "C" {
     // The CUDA function name must match this.
     fn spme_inverse_ffts_3_c2c(

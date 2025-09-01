@@ -1,0 +1,14 @@
+[package]
+name = "ewald_py"
+version = "0.1.3"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+
+[dependencies]
+ewald_rs = { package = "ewald", path = ".." }
+pyo3 = { version = "0.26.0", features = ["extension-module", "abi3-py310"] }
+
+lin_alg = "1.3.5"

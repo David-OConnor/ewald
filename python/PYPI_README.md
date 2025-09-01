@@ -45,9 +45,9 @@ impl System {
                 let diff = atom_1.pos - atom_0.pos;
                 let r = diff.magnitude();
                 let dir = diff / r;
-    
+
                 let mut f = Vec3::zero();
-    
+
                 let (f, energy) = force_coulomb_short_range(
                     dir,
                     r,
@@ -60,7 +60,7 @@ impl System {
                     LONG_RANGE_CUTOFF,
                     ALPHA,
                 );
-    
+
                 atom_0.force += f;
                 atom_1.force -= f;
             });
