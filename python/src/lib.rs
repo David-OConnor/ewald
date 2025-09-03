@@ -16,7 +16,7 @@ impl PmeRecip {
         }
     }
 
-    fn forces(&mut self, posits: Vec<[f64; 3]>, q: Vec<f64>) -> Vec<[f64; 3]> {
+    fn forces(&mut self, posits: Vec<[f64; 3]>, q: Vec<f64>) -> (Vec<[f64; 3]>, f64) {
         let posits: Vec<_> = posits.iter().map(|p| Vec3::from_slice(p).unwrap()).collect();
         let result = self.inner.forces(&posits, &q);
 

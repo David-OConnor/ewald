@@ -19,6 +19,11 @@ use std::{
 };
 
 #[cfg(feature = "cuda")]
+mod cuda_ffi;
+
+#[cfg(feature = "cuda")]
+use cuda_ffi::{flatten_cplx_vec, unflatten_cplx_vec};
+#[cfg(feature = "cuda")]
 use cudarc::driver::{
     CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, sys::CUstream,
 };
@@ -55,31 +60,44 @@ pub struct PmeRecip {
     bmod2_x: Vec<f64>,
     bmod2_y: Vec<f64>,
     bmod2_z: Vec<f64>,
+    // todo: Remove this if on Cuda, eventually
+    // #[cfg(not(featuer = "cuda"))
     planner: FftPlanner<f64>,
+    #[cfg(feature = "cuda")]
+    planner_gpu: *mut std::ffi::c_void,
+    // todo: Do you want this? Or is it the same as nx, ny, nz?
+    #[cfg(feature = "cuda")]
+    plan_dims: (i32, i32, i32),
 }
 
-impl Default for PmeRecip {
-    // todo: Rust needs a beter solution for this.
-    fn default() -> Self {
-        Self {
-            nx: 0,
-            ny: 0,
-            nz: 0,
-            lx: 0.,
-            ly: 0.,
-            lz: 0.,
-            vol: 0.,
-            alpha: 0.,
-            kx: Vec::new(),
-            ky: Vec::new(),
-            kz: Vec::new(),
-            bmod2_x: Vec::new(),
-            bmod2_y: Vec::new(),
-            bmod2_z: Vec::new(),
-            planner: FftPlanner::new(),
-        }
-    }
-}
+// impl Default for PmeRecip {
+//     // todo: Rust needs a beter solution for this.
+//
+//     // todo note: The PME planner[s] must be rebuilt if the nx etc dimensions change.
+//     fn default() -> Self {
+//         Self {
+//             nx: 0,
+//             ny: 0,
+//             nz: 0,
+//             lx: 0.,
+//             ly: 0.,
+//             lz: 0.,
+//             vol: 0.,
+//             alpha: 0.,
+//             kx: Vec::new(),
+//             ky: Vec::new(),
+//             kz: Vec::new(),
+//             bmod2_x: Vec::new(),
+//             bmod2_y: Vec::new(),
+//             bmod2_z: Vec::new(),
+//             planner: FftPlanner::new(),
+//             #[cfg(feature = "cuda")]
+//             planner_gpu: std::ptr::null_mut(),
+//             #[cfg(feature = "cuda")]
+//             plan_dims: (0, 0, 0),
+//         }
+//     }
+// }
 
 impl PmeRecip {
     pub fn new(n: (usize, usize, usize), l: (f64, f64, f64), alpha: f64) -> Self {
@@ -111,16 +129,21 @@ impl PmeRecip {
             bmod2_y,
             bmod2_z,
             planner: FftPlanner::new(),
+            #[cfg(feature = "cuda")]
+            planner_gpu: std::ptr::null_mut(),
+            #[cfg(feature = "cuda")]
+            plan_dims: (0, 0, 0),
+            // ..Default::default()
         }
     }
 
-    /// Helper to reduce DRY between GPU and CPU variants.
+    /// Helper to reduce DRY between GPU and CPU variants. Also returns potential energy.
     /// Note: Parallelization here doesn't seem to have much effect.
     fn forces_part_b(
         &self,
         rho: &[Complex<f64>],
         n_pts: usize,
-    ) -> (Vec<Complex<f64>>, Vec<Complex<f64>>, Vec<Complex<f64>>) {
+    ) -> (Vec<Complex<f64>>, Vec<Complex<f64>>, Vec<Complex<f64>>, f64) {
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (nx, ny, _nz) = (self.nx, self.ny, self.nz);
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -133,11 +156,12 @@ impl PmeRecip {
         let mut ezk = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
 
         // let start = Instant::now();
-        exk.par_iter_mut()
+        let energy: f64 = exk
+            .par_iter_mut()
             .zip(eyk.par_iter_mut())
             .zip(ezk.par_iter_mut())
             .enumerate()
-            .for_each(|(idx, ((ex, ey), ez))| {
+            .map(|(idx, ((ex, ey), ez))| {
                 let ix = idx % nx;
                 let iy = (idx / nx) % ny;
                 let iz = idx / (nx * ny);
@@ -151,7 +175,7 @@ impl PmeRecip {
                     *ex = Complex::new(0.0, 0.0);
                     *ey = Complex::new(0.0, 0.0);
                     *ez = Complex::new(0.0, 0.0);
-                    return;
+                    return 0.;
                 }
 
                 let bmod2 = bx[ix] * by[iy] * bz[iz];
@@ -159,7 +183,7 @@ impl PmeRecip {
                     *ex = Complex::new(0.0, 0.0);
                     *ey = Complex::new(0.0, 0.0);
                     *ez = Complex::new(0.0, 0.0);
-                    return;
+                    return 0.;
                 }
 
                 // φ(k) = G(k) ρ(k) with B-spline deconvolution
@@ -170,9 +194,13 @@ impl PmeRecip {
                 *ex = Complex::new(0.0, -kxv) * phi_k;
                 *ey = Complex::new(0.0, -kyv) * phi_k;
                 *ez = Complex::new(0.0, -kzv) * phi_k;
-            });
 
-        (exk, eyk, ezk)
+                // reciprocal-space energy density: (1/2) Re{ ρ*(k) φ(k) }
+                0.5 * (rho[idx].conj() * phi_k).re
+            })
+            .sum();
+
+        (exk, eyk, ezk, energy)
     }
 
     /// Interpolate E back to particles with the same B-spline weights; F = q E
@@ -186,43 +214,49 @@ impl PmeRecip {
         ezk: &[Complex<f64>],
         q: &[f64],
     ) -> Vec<Vec3> {
+        let nx = self.nx;
+        let ny = self.ny;
+        let nz = self.nz;
+        let lx = self.lx;
+        let ly = self.ly;
+        let lz = self.lz;
+
         pos.par_iter()
             .enumerate()
             .map(|(i, &r)| {
-                let (ix0, wx) = bspline4_weights(r.x / self.lx * self.nx as f64);
-                let (iy0, wy) = bspline4_weights(r.y / self.ly * self.ny as f64);
-                let (iz0, wz) = bspline4_weights(r.z / self.lz * self.nz as f64);
+                let (ix0, wx) = bspline4_weights(r.x / lx * nx as f64);
+                let (iy0, wy) = bspline4_weights(r.y / ly * ny as f64);
+                let (iz0, wz) = bspline4_weights(r.z / lz * nz as f64);
 
                 let mut e = Vec3::new_zero();
 
                 for a in 0..4 {
-                    let ix = wrap(ix0 + a as isize, self.nx);
+                    let ix = wrap(ix0 + a as isize, nx);
                     let wxa = wx[a];
 
                     for b in 0..4 {
-                        let iy = wrap(iy0 + b as isize, self.ny);
+                        let iy = wrap(iy0 + b as isize, ny);
                         let wyb = wy[b];
                         let wxy = wxa * wyb;
 
                         for c in 0..4 {
-                            let iz = wrap(iz0 + c as isize, self.nz);
+                            let iz = wrap(iz0 + c as isize, nz);
                             let w = wxy * wz[c];
-                            let idx = iz * (self.nx * self.ny) + iy * self.nx + ix;
+                            let idx = iz * (nx * ny) + iy * nx + ix;
 
-                            e.x += w * exk[idx].re; // after inverse FFT, fields are real (imag ~ 0)
+                            e.x += w * exk[idx].re;
                             e.y += w * eyk[idx].re;
                             e.z += w * ezk[idx].re;
                         }
                     }
                 }
-                // F = q * E
-                e * (q[i])
+                e * q[i]
             })
             .collect()
     }
 
     /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
-    pub fn forces(&mut self, posits: &[Vec3], q: &[f64]) -> Vec<Vec3> {
+    pub fn forces(&mut self, posits: &[Vec3], q: &[f64]) -> (Vec<Vec3>, f64) {
         assert_eq!(posits.len(), q.len());
 
         let n_pts = self.nx * self.ny * self.nz;
@@ -236,7 +270,7 @@ impl PmeRecip {
             true,
         );
 
-        let (mut exk, mut eyk, mut ezk) = self.forces_part_b(&rho, n_pts);
+        let (mut exk, mut eyk, mut ezk, energy) = self.forces_part_b(&rho, n_pts);
         // let elapsed = start.elapsed();
         // println!("SPME A: {} us", elapsed.as_micros());
 
@@ -265,12 +299,16 @@ impl PmeRecip {
         // println!("SPME B: {} us", elapsed.as_micros());
 
         // let start = Instant::now();
-        let result = self.forces_part_c(posits, &exk, &eyk, &ezk, q);
+        let f = self.forces_part_c(posits, &exk, &eyk, &ezk, q);
 
         // let elapsed = start.elapsed();
         // println!("SPME C: {} us", elapsed.as_micros());
 
-        result
+        // Interpolate φ to particles and compute ½ Σ q_i φ_i
+        // let phi_vals = self.interpolate_scalar(posits, &phi_k);
+        // let energy = 0.5 * q.iter().zip(phi_vals.iter()).map(|(qi, phi)| qi * phi).sum::<f64>();
+
+        (f, energy)
     }
 
     #[cfg(feature = "cuda")]
@@ -282,16 +320,19 @@ impl PmeRecip {
     pub fn forces_gpu(
         &mut self,
         stream: &Arc<CudaStream>,
-        module: &Arc<CudaModule>,
+        _module: &Arc<CudaModule>,
         pos: &[Vec3],
         q: &[f64],
-    ) -> Vec<Vec3> {
+    ) -> (Vec<Vec3>, f64) {
         assert_eq!(pos.len(), q.len());
+
         let n_pts = self.nx * self.ny * self.nz;
         let mut rho = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
         self.spread_charges(pos, q, &mut rho);
 
         let start = Instant::now();
+
+        // todo: Move this to the GPU as well.
         fft3_inplace(
             &mut rho,
             (self.nx, self.ny, self.nz),
@@ -302,16 +343,16 @@ impl PmeRecip {
         let elapsed = start.elapsed();
         println!("SPME FFT A: {} ms", elapsed.as_millis());
 
-        let (mut exk, mut eyk, mut ezk) = self.forces_part_b(&rho, n_pts);
+        let (mut exk, mut eyk, mut ezk, energy) = self.forces_part_b(&rho, n_pts);
 
-        let mut exk_test = exk.clone();
-        // todo temp. Note: The tests disagree, and the CPU version is reporting 0s?
-        fft3_inplace(
-            &mut exk_test,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
+        // let mut exk_test = exk.clone();
+        // // todo temp. Note: The tests disagree, and the CPU version is reporting 0s?
+        // fft3_inplace(
+        //     &mut exk_test,
+        //     (self.nx, self.ny, self.nz),
+        //     &mut self.planner,
+        //     false,
+        // );
 
         let start = Instant::now();
         // Run the inverse FFTs on the GPU.
@@ -320,46 +361,62 @@ impl PmeRecip {
             let eyk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&eyk)).unwrap();
             let ezk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&ezk)).unwrap();
 
+            // m// Potential energy.
+            // let energy_gpu = stream.memcpy_stod(&[0.0f64]).unwrap();
+
             // Get raw CUdeviceptrs tied to this stream.
             // IMPORTANT: keep the guards alive until after the FFI call returns.
             let (exk_ptr, _exk_guard) = exk_gpu.device_ptr(stream);
             let (eyk_ptr, _eyk_guard) = eyk_gpu.device_ptr(stream);
             let (ezk_ptr, _ezk_guard) = ezk_gpu.device_ptr(stream);
+            // let (energy_ptr, _energy_guard) = energy_gpu.device_ptr(stream);
 
-            let nx = exk.len();
-            let ny = eyk.len();
-            let nz = ezk.len();
+            self.ensure_gpu_plan(stream);
+
+            let cu_stream: CUstream = stream.cu_stream();
+            let raw_stream = cu_stream as *mut std::ffi::c_void;
+            let n_complex = self.nx * self.ny * self.nz;
+
+            let scale = 1.0f32 / (self.nx as f32 * self.ny as f32 * self.nz as f32);
 
             // Call the cuFFT wrapper (still runs on GPU; invoked from host)
+            // ---- E) Run three inverse FFTs + 1/N scaling on GPU ----
             unsafe {
-                spme_inverse_ffts_3_c2c(
+                cuda_ffi::spme_exec_inverse_3_c2c(
+                    self.planner_gpu,
                     exk_ptr as *mut std::ffi::c_void,
                     eyk_ptr as *mut std::ffi::c_void,
                     ezk_ptr as *mut std::ffi::c_void,
-                    self.nx as i32,
-                    self.ny as i32,
-                    self.nz as i32,
                 );
+
+                // Apply normalization expected by your CPU path
+                cuda_ffi::spme_scale_c2c(exk_ptr as *mut _, n_complex, scale, raw_stream);
+                cuda_ffi::spme_scale_c2c(eyk_ptr as *mut _, n_complex, scale, raw_stream);
+                cuda_ffi::spme_scale_c2c(ezk_ptr as *mut _, n_complex, scale, raw_stream);
             }
+
+            // todo: Rerquired?
+            stream.synchronize().expect("stream sync");
 
             exk = unflatten_cplx_vec(&stream.memcpy_dtov(&exk_gpu).unwrap());
             eyk = unflatten_cplx_vec(&stream.memcpy_dtov(&eyk_gpu).unwrap());
             ezk = unflatten_cplx_vec(&stream.memcpy_dtov(&ezk_gpu).unwrap());
+            // energy = stream.memcpy_dtov(&energy_gpu).unwrap()[0];
         }
 
         // todo temp. And, this test is... showing 0 for the CPU values?
-        println!("CPU: {:.4?}", &exk_test[0..10]);
-        println!("GPU : {:.4?}", &exk[0..10]);
+        // println!("CPU: {:.4?}", &exk_test[0..10]);
+        println!("GPU exk[..10] = {:?}", &exk[..10]);
 
         let elapsed = start.elapsed();
         println!("SPME FFT B: {} ms", elapsed.as_millis());
 
         // let start = Instant::now();
-        let result = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
+        let f = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
         // let elapsed = start.elapsed();
         // println!("SPME recip B: {} us", elapsed.as_millis());
 
-        result
+        (f, energy)
     }
 
     fn spread_charges(&self, pos: &[Vec3], q: &[f64], rho: &mut [Complex<f64>]) {
@@ -652,39 +709,36 @@ pub fn ewald_comp_force(dir: Vec3, r: f64, qi: f64, qj: f64, alpha: f64) -> Vec3
 }
 
 #[cfg(feature = "cuda")]
-/// For CUDA serialization
-fn flatten_cplx_vec(v: &[Complex<f64>]) -> Vec<f32> {
-    let mut result = Vec::with_capacity(v.len() * 2);
+impl PmeRecip {
+    fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
+        use std::ffi::c_void;
+        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
 
-    for v_ in v {
-        result.push(v_.re as f32);
-        result.push(v_.im as f32);
+        // Obtain the raw CUstream from cudarc:
+        let cu_stream: CUstream = stream.cu_stream();
+        let raw_stream: *mut c_void = cu_stream as *mut c_void;
+
+        unsafe {
+            if self.planner_gpu.is_null() || self.plan_dims != dims {
+                if !self.planner_gpu.is_null() {
+                    cuda_ffi::spme_destroy_plan(self.planner_gpu);
+                    self.planner_gpu = std::ptr::null_mut();
+                }
+                self.planner_gpu = cuda_ffi::spme_make_plan_c2c(dims.0, dims.1, dims.2, raw_stream);
+                self.plan_dims = dims;
+            }
+        }
     }
-
-    result
 }
 
 #[cfg(feature = "cuda")]
-/// For CUDA deserialization
-fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f64>> {
-    let mut result = Vec::with_capacity(v.len() / 2);
-
-    for i in 0..v.len() / 2 {
-        result.push(Complex::new(v[i * 2] as f64, v[i * 2 + 1] as f64));
+impl Drop for PmeRecip {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.planner_gpu.is_null() {
+                cuda_ffi::spme_destroy_plan(self.planner_gpu);
+                self.planner_gpu = std::ptr::null_mut();
+            }
+        }
     }
-
-    result
-}
-
-#[cfg(feature = "cuda")]
-unsafe extern "C" {
-    // The CUDA function name must match this.
-    fn spme_inverse_ffts_3_c2c(
-        exk: *mut std::ffi::c_void,
-        eyk: *mut std::ffi::c_void,
-        ezk: *mut std::ffi::c_void,
-        nx: i32,
-        ny: i32,
-        nz: i32,
-    );
 }

@@ -65,7 +65,7 @@ impl System {
                 atom_1.force -= f;
             });
 
-        let recip_forces_per_atom = self.pme_recip.forces(&atom_posits, &[atom_charges]);
+        let (recip_forces_per_atom, energy_recip) = self.pme_recip.forces(&atom_posits, &[atom_charges]);
     }
 
     /// Run this at init, and whenever you update the sim box.
