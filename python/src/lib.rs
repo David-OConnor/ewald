@@ -18,9 +18,11 @@ impl PmeRecip {
 
     fn forces(&mut self, posits: Vec<[f64; 3]>, q: Vec<f64>) -> (Vec<[f64; 3]>, f64) {
         let posits: Vec<_> = posits.iter().map(|p| Vec3::from_slice(p).unwrap()).collect();
-        let result = self.inner.forces(&posits, &q);
+        let (f, e) = self.inner.forces(&posits, &q);
 
-        result.iter().map(|r| r.to_arr()).collect()
+        let f = f.iter().map(|r| r.to_arr()).collect();
+
+        (f, e)
     }
 
     // todo: forces_gpu A/R.
