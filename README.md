@@ -15,10 +15,8 @@ n-body approximations for long-range forces, this has utility when periodic boun
 If not using these, for example in cosmology simulations, consider Barnes Hut, or Fast Multipole Methods (FMM)
 instead.
 
-Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), and CUDA (via CUDARC) are planned. For now, you may wish to write
-custom GPU kernels, using this lib as a reference.
-
-WIP code for using the SPME/recip interaction on GPU.
+Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable 
+the `cuda` feature in `Cargo.toml`.
 
 Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus).
 
