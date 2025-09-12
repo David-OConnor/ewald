@@ -2,19 +2,20 @@
 #![allow(mixed_script_confusables)]
 #![allow(confusable_idents)]
 #![allow(clippy::needless_range_loop)]
+// #![feature(core_float_math)] When stable
 
 //! For Smooth-Particle-Mesh Ewald; a standard approximation for Coulomb forces in MD.
 //! We use this to handle periodic boundary conditions properly, which we use to take the
 //! water molecules into account.
 
-// todo: f32 support / generic floats
+// todo: Ask about where you should use f64!
 
-// todo: Add CUDA and SIMD support.
+extern crate core;
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 use std::{
-    f64::consts::{PI, TAU},
+    f32::consts::{PI, TAU},
     time::Instant,
 };
 
@@ -24,45 +25,46 @@ mod cuda_ffi;
 #[cfg(feature = "cuda")]
 use cuda_ffi::{flatten_cplx_vec, unflatten_cplx_vec};
 #[cfg(feature = "cuda")]
-use cudarc::driver::{
-    CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, sys::CUstream,
-};
+use cudarc::driver::{CudaModule, CudaStream, DevicePtr, PushKernelArg, sys::CUstream};
 // todo: This may be a good candidate for a standalone library.
-use lin_alg::f64::Vec3;
+use lin_alg::f32::Vec3;
 #[cfg(target_arch = "x86_64")]
 use lin_alg::f64::{Vec3x8, f64x8};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
-const SQRT_PI: f64 = 1.7724538509055159;
-const INV_SQRT_PI: f64 = 1. / SQRT_PI;
+const SQRT_PI: f32 = 1.7724538509055159;
+const INV_SQRT_PI: f32 = 1. / SQRT_PI;
+const TWO_INV_SQRT_PI: f32 = 2. / SQRT_PI;
 
 const SPLINE_ORDER: usize = 4;
+
+type Complex_ = Complex<f32>;
 
 /// Initialize this once for the application, or once per step.
 pub struct PmeRecip {
     nx: usize,
     ny: usize,
     nz: usize,
-    lx: f64,
-    ly: f64,
-    lz: f64,
-    vol: f64,
+    lx: f32,
+    ly: f32,
+    lz: f32,
+    vol: f32,
     /// A tunable variable used in the splitting between short range and long range forces.
     /// A bigger α means more damping, and a smaller real-space contribution. (Cheaper real), but larger
     /// reciprocal load.
-    pub alpha: f64,
+    pub alpha: f32,
     // Precomputed k-vectors and B-spline deconvolution |B(k)|^2
-    kx: Vec<f64>,
-    ky: Vec<f64>,
-    kz: Vec<f64>,
-    bmod2_x: Vec<f64>,
-    bmod2_y: Vec<f64>,
-    bmod2_z: Vec<f64>,
+    kx: Vec<f32>,
+    ky: Vec<f32>,
+    kz: Vec<f32>,
+    bmod2_x: Vec<f32>,
+    bmod2_y: Vec<f32>,
+    bmod2_z: Vec<f32>,
     // todo: Remove this if on Cuda, eventually
     // #[cfg(not(featuer = "cuda"))
-    planner: FftPlanner<f64>,
+    planner: FftPlanner<f32>,
     #[cfg(feature = "cuda")]
     planner_gpu: *mut std::ffi::c_void,
     // todo: Do you want this? Or is it the same as nx, ny, nz?
@@ -100,7 +102,7 @@ pub struct PmeRecip {
 // }
 
 impl PmeRecip {
-    pub fn new(n: (usize, usize, usize), l: (f64, f64, f64), alpha: f64) -> Self {
+    pub fn new(n: (usize, usize, usize), l: (f32, f32, f32), alpha: f32) -> Self {
         assert!(n.0 >= 4 && n.1 >= 4 && n.2 >= 4);
 
         let vol = l.0 * l.1 * l.2;
@@ -141,9 +143,9 @@ impl PmeRecip {
     /// Note: Parallelization here doesn't seem to have much effect.
     fn forces_part_b(
         &self,
-        rho: &[Complex<f64>],
+        rho: &[Complex_],
         n_pts: usize,
-    ) -> (Vec<Complex<f64>>, Vec<Complex<f64>>, Vec<Complex<f64>>, f64) {
+    ) -> (Vec<Complex_>, Vec<Complex_>, Vec<Complex_>, f32) {
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (nx, ny, _nz) = (self.nx, self.ny, self.nz);
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -151,9 +153,9 @@ impl PmeRecip {
         let (vol, alpha) = (self.vol, self.alpha);
 
         // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        let mut exk = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
-        let mut eyk = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
-        let mut ezk = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
+        let mut exk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
+        let mut eyk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
+        let mut ezk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
 
         // let start = Instant::now();
         let energy: f64 = exk
@@ -170,7 +172,8 @@ impl PmeRecip {
                 let kyv = ky[iy];
                 let kzv = kz[iz];
 
-                let k2 = kxv * kxv + kyv * kyv + kzv * kzv;
+                // let k2 = kxv * kxv + kyv * kyv + kzv * kzv;
+                let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
                 if k2 == 0.0 {
                     *ex = Complex::new(0.0, 0.0);
                     *ey = Complex::new(0.0, 0.0);
@@ -196,11 +199,14 @@ impl PmeRecip {
                 *ez = Complex::new(0.0, -kzv) * phi_k;
 
                 // reciprocal-space energy density: (1/2) Re{ ρ*(k) φ(k) }
-                0.5 * (rho[idx].conj() * phi_k).re
+                // 0.5 * (rho[idx].conj() * phi_k).re as f64
+                let re64 = (rho[idx].re as f64) * (phi_k.re as f64)
+                    + (rho[idx].im as f64) * (phi_k.im as f64);
+                0.5 * re64
             })
             .sum();
 
-        (exk, eyk, ezk, energy)
+        (exk, eyk, ezk, energy as f32)
     }
 
     /// Interpolate E back to particles with the same B-spline weights; F = q E
@@ -209,10 +215,10 @@ impl PmeRecip {
     fn forces_part_c(
         &self,
         pos: &[Vec3],
-        exk: &[Complex<f64>],
-        eyk: &[Complex<f64>],
-        ezk: &[Complex<f64>],
-        q: &[f64],
+        exk: &[Complex_],
+        eyk: &[Complex_],
+        ezk: &[Complex_],
+        q: &[f32],
     ) -> Vec<Vec3> {
         let nx = self.nx;
         let ny = self.ny;
@@ -224,11 +230,13 @@ impl PmeRecip {
         pos.par_iter()
             .enumerate()
             .map(|(i, &r)| {
-                let (ix0, wx) = bspline4_weights(r.x / lx * nx as f64);
-                let (iy0, wy) = bspline4_weights(r.y / ly * ny as f64);
-                let (iz0, wz) = bspline4_weights(r.z / lz * nz as f64);
+                let (ix0, wx) = bspline4_weights(r.x / lx * nx as f32);
+                let (iy0, wy) = bspline4_weights(r.y / ly * ny as f32);
+                let (iz0, wz) = bspline4_weights(r.z / lz * nz as f32);
 
-                let mut e = Vec3::new_zero();
+                let mut ex = 0.0f64;
+                let mut ey = 0.0f64;
+                let mut ez = 0.0f64;
 
                 for a in 0..4 {
                     let ix = wrap(ix0 + a as isize, nx);
@@ -241,26 +249,35 @@ impl PmeRecip {
 
                         for c in 0..4 {
                             let iz = wrap(iz0 + c as isize, nz);
-                            let w = wxy * wz[c];
+                            let w = (wxy * wz[c]) as f64;
                             let idx = iz * (nx * ny) + iy * nx + ix;
 
-                            e.x += w * exk[idx].re;
-                            e.y += w * eyk[idx].re;
-                            e.z += w * ezk[idx].re;
+                            ex = w.mul_add(exk[idx].re as f64, ex);
+                            ey = w.mul_add(eyk[idx].re as f64, ey);
+                            ez = w.mul_add(ezk[idx].re as f64, ez);
                         }
                     }
                 }
-                e * q[i]
+
+                let qi = q[i] as f64;
+                let e = Vec3 {
+                    x: (ex * qi) as f32,
+                    y: (ey * qi) as f32,
+                    z: (ez * qi) as f32,
+                };
+                e
+
+                // e * q[i] as f64
             })
             .collect()
     }
 
     /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
-    pub fn forces(&mut self, posits: &[Vec3], q: &[f64]) -> (Vec<Vec3>, f64) {
+    pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
 
         let n_pts = self.nx * self.ny * self.nz;
-        let mut rho = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
+        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
         self.spread_charges(posits, q, &mut rho);
 
         fft3_inplace(
@@ -322,12 +339,12 @@ impl PmeRecip {
         stream: &Arc<CudaStream>,
         _module: &Arc<CudaModule>,
         pos: &[Vec3],
-        q: &[f64],
-    ) -> (Vec<Vec3>, f64) {
+        q: &[f32],
+    ) -> (Vec<Vec3>, f32) {
         assert_eq!(pos.len(), q.len());
 
         let n_pts = self.nx * self.ny * self.nz;
-        let mut rho = vec![Complex::<f64>::new(0.0, 0.0); n_pts];
+        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
         self.spread_charges(pos, q, &mut rho);
 
         let start = Instant::now();
@@ -419,13 +436,13 @@ impl PmeRecip {
         (f, energy)
     }
 
-    fn spread_charges(&self, pos: &[Vec3], q: &[f64], rho: &mut [Complex<f64>]) {
+    fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
         let nxny = self.nx * self.ny;
         for (r, &qi) in pos.iter().zip(q.iter()) {
             // fractional grid coords
-            let sx = r.x / self.lx * self.nx as f64;
-            let sy = r.y / self.ly * self.ny as f64;
-            let sz = r.z / self.lz * self.nz as f64;
+            let sx = r.x / self.lx * self.nx as f32;
+            let sy = r.y / self.ly * self.ny as f32;
+            let sz = r.z / self.lz * self.nz as f32;
 
             let (ix0, wx) = bspline4_weights(sx);
             let (iy0, wy) = bspline4_weights(sy);
@@ -452,7 +469,7 @@ impl PmeRecip {
 }
 
 /// k-array for an orthorhombic cell; FFT index convention → physical wavevector.
-fn make_k_array(n: usize, L: f64) -> Vec<f64> {
+fn make_k_array(n: usize, L: f32) -> Vec<f32> {
     let tau_div_l = TAU / L;
 
     let mut out = vec![0.0; n];
@@ -465,14 +482,14 @@ fn make_k_array(n: usize, L: f64) -> Vec<f64> {
         } else {
             (i as isize) - (n as isize)
         };
-        *out_ = tau_div_l * (fi as f64);
+        *out_ = tau_div_l * (fi as f32);
     }
     out
 }
 
 /// |B(k)|^2 for B-spline of order m (PME deconvolution).
 /// Use signed/wrapped index distance to 0 to avoid over-amplifying near Nyquist.
-fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f64> {
+fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
     assert!(m >= 1);
     let mut v = vec![0.0; n];
 
@@ -482,7 +499,7 @@ fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f64> {
         if k == 0 {
             *val = 1.0; // sinc(0) = 1
         } else {
-            let t = PI * (k as f64) / (n as f64); // = |ω|/2 with ω=2πk/n
+            let t = PI * (k as f32) / (n as f32); // = |ω|/2 with ω=2πk/n
             let s = t.sin() / t; // sinc(|ω|/2)
             *val = s.powi((m as i32) * 2); // |B(ω)|^2 = sinc^(2m)
         }
@@ -492,14 +509,15 @@ fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f64> {
 
 /// Cubic B-spline weights for 4 neighbors; returns starting index and 4 weights.
 /// Input s is in grid units (0..n), arbitrary real; we wrap indices to the grid.
-fn bspline4_weights(s: f64) -> (isize, [f64; 4]) {
+fn bspline4_weights(s: f32) -> (isize, [f32; 4]) {
     let sfloor = s.floor();
     let u = s - sfloor; // fractional part in [0,1)
     let i0 = sfloor as isize - 1; // left-most point of 4-support
 
     // Cardinal cubic B-spline weights (order 4)
     let u2 = u * u;
-    let u3 = u2 * u;
+    // let u3 = u2 * u;
+    let u3 = u2.mul_add(u, 0.0);
 
     let w0 = (1.0 - u).powi(3) / 6.0;
     let w1 = (3.0 * u3 - 6.0 * u2 + 4.0) / 6.0;
@@ -522,9 +540,9 @@ fn wrap(i: isize, n: usize) -> usize {
 /// Minimal, cache-friendly 3D FFT using rustfft 1D plans along each axis.
 /// dir=true => forward; dir=false => inverse (and rustfft handles scaling=1).
 fn fft3_inplace(
-    data: &mut [Complex<f64>],
+    data: &mut [Complex_],
     dims: (usize, usize, usize),
-    planner: &mut FftPlanner<f64>,
+    planner: &mut FftPlanner<f32>,
     forward: bool,
 ) {
     let (nx, ny, nz) = dims;
@@ -558,7 +576,7 @@ fn fft3_inplace(
 
     // Y transforms (strided by nx)
     {
-        let mut tmp = vec![Complex::<f64>::new(0.0, 0.0); ny];
+        let mut tmp = vec![Complex::<f32>::new(0.0, 0.0); ny];
         for iz in 0..nz {
             for ix in 0..nx {
                 // gather
@@ -577,7 +595,7 @@ fn fft3_inplace(
 
     // Z transforms (strided by nx*ny)
     {
-        let mut tmp = vec![Complex::<f64>::new(0.0, 0.0); nz];
+        let mut tmp = vec![Complex::<f32>::new(0.0, 0.0); nz];
         for iy in 0..ny {
             for ix in 0..nx {
                 // gather
@@ -597,7 +615,7 @@ fn fft3_inplace(
     // rustfft inverse is unnormalized; many MD codes keep that and balance elsewhere.
     // If you prefer normalized inverse, scale here by 1/(nx*ny*nz) after inverse passes.
     if !forward {
-        let scale = 1.0 / (len as f64);
+        let scale = 1.0 / (len as f32);
         for v in data.iter_mut() {
             v.re *= scale;
             v.im *= scale;
@@ -628,15 +646,15 @@ fn _taper(s: f64) -> (f64, f64) {
 /// Also returns potential energy.
 pub fn force_coulomb_short_range(
     dir: Vec3,
-    dist: f64,
+    dist: f32,
     // Included to share between this and Lennard Jones.
-    inv_dist: f64,
-    q_0: f64,
-    q_1: f64,
+    inv_dist: f32,
+    q_0: f32,
+    q_1: f32,
     // lr_switch: (f64, f64),
-    cutoff_dist: f64,
-    α: f64,
-) -> (Vec3, f64) {
+    cutoff_dist: f32,
+    α: f32,
+) -> (Vec3, f32) {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
     // if r >= lr_switch.1 {
     if dist > cutoff_dist {
@@ -644,7 +662,7 @@ pub fn force_coulomb_short_range(
     }
 
     let α_r = α * dist;
-    let erfc_term = erfc(α_r);
+    let erfc_term = erfc(α_r as f64) as f32;
     let charge_term = q_0 * q_1;
 
     let energy = charge_term * inv_dist * erfc_term;
@@ -697,14 +715,17 @@ pub fn force_coulomb_short_range(
 // }
 
 /// Useful for scaling corrections, e.g. 1-4 exclusions in AMBER.
-pub fn ewald_comp_force(dir: Vec3, r: f64, qi: f64, qj: f64, alpha: f64) -> Vec3 {
+pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3 {
     // Complement of the real-space Ewald kernel; this is what “belongs” to reciprocal.
     let qfac = qi * qj;
     let inv_r = 1.0 / r;
     let inv_r2 = inv_r * inv_r;
 
     let ar = alpha * r;
-    let fmag = qfac * (erf(ar) * inv_r2 - (2.0 * alpha * INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
+    // todo: Mul_add when it's stable.
+    let fmag = qfac
+        * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
+    // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
 }
 

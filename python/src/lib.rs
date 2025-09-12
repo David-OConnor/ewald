@@ -1,5 +1,5 @@
 use ewald_rs;
-use lin_alg::f64::Vec3;
+use lin_alg::f32::Vec3;
 use pyo3::prelude::*;
 
 #[pyclass]
@@ -10,13 +10,13 @@ struct PmeRecip {
 #[pymethods]
 impl PmeRecip {
     #[new]
-    fn new(n: (usize, usize, usize), l: (f64, f64, f64), alpha: f64) -> Self {
+    fn new(n: (usize, usize, usize), l: (f32, f32, f32), alpha: f32) -> Self {
         Self {
             inner: ewald_rs::PmeRecip::new(n, l, alpha),
         }
     }
 
-    fn forces(&mut self, posits: Vec<[f64; 3]>, q: Vec<f64>) -> (Vec<[f64; 3]>, f64) {
+    fn forces(&mut self, posits: Vec<[f32; 3]>, q: Vec<f32>) -> (Vec<[f32; 3]>, f32) {
         let posits: Vec<_> = posits.iter().map(|p| Vec3::from_slice(p).unwrap()).collect();
         let (f, e) = self.inner.forces(&posits, &q);
 
@@ -36,14 +36,14 @@ impl PmeRecip {
 
 #[pyfunction]
 fn force_coulomb_short_range(
-    dir: [f64; 3],
-    dist: f64,
-    inv_dist: f64,
-    q_0: f64,
-    q_1: f64,
-    cutoff_dist: f64,
-    alpha: f64,
-) -> ([f64; 3], f64) {
+    dir: [f32; 3],
+    dist: f32,
+    inv_dist: f32,
+    q_0: f32,
+    q_1: f32,
+    cutoff_dist: f32,
+    alpha: f32,
+) -> ([f32; 3], f32) {
     let dir = Vec3::from_slice(&dir).unwrap();
     let result = ewald_rs::force_coulomb_short_range(
         dir,

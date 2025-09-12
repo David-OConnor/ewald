@@ -18,7 +18,10 @@ instead.
 Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable 
 the `cuda` feature in `Cargo.toml`.
 
-Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus).
+Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
+the [Dynamics library](https://github.com/david-oconnor/dynamics).
+
+Uses f32 for Lennard Jones and Coulomb. Energy sums are computed as f64.
 
 Here's an example of use. The Python API is equivalent.
 
@@ -26,11 +29,11 @@ Here's an example of use. The Python API is equivalent.
 use rayon::prelude::*;
 use ewald::{force_coulomb_ewald_real, force_coulomb_ewald_real};
 
-const LONG_RANGE_CUTOFF: f64 = 10.0;
+const LONG_RANGE_CUTOFF: f32 = 10.0;
 
 // A bigger α means more damping, and a smaller real-space contribution. (Cheaper real), but larger
 // reciprocal load.
-const EWALD_ALPHA: f64 = 0.35; // Å^-1. 0.35 is good for cutoff = 10.
+const EWALD_ALPHA: f32 = 0.35; // Å^-1. 0.35 is good for cutoff = 10.
 
 impl System {
     // Primary application:

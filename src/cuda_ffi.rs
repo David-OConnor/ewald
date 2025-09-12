@@ -32,23 +32,23 @@ unsafe extern "C" {
 }
 
 /// For CUDA serialization
-pub(crate) fn flatten_cplx_vec(v: &[Complex<f64>]) -> Vec<f32> {
+pub(crate) fn flatten_cplx_vec(v: &[Complex<f32>]) -> Vec<f32> {
     let mut result = Vec::with_capacity(v.len() * 2);
 
     for v_ in v {
-        result.push(v_.re as f32);
-        result.push(v_.im as f32);
+        result.push(v_.re);
+        result.push(v_.im);
     }
 
     result
 }
 
 /// For CUDA deserialization
-pub(crate) fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f64>> {
+pub(crate) fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f32>> {
     let mut result = Vec::with_capacity(v.len() / 2);
 
     for i in 0..v.len() / 2 {
-        result.push(Complex::new(v[i * 2] as f64, v[i * 2 + 1] as f64));
+        result.push(Complex::new(v[i * 2], v[i * 2 + 1]));
     }
 
     result
