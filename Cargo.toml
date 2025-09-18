@@ -32,7 +32,7 @@ cudarc = { version = "0.17.2", default-features = false, features = ["std", "dri
 [target.'cfg(target_os = "windows")'.dependencies]
 cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13000"], optional=true }
 
-bytemuck = "1.23.2"
+bytemuck = { version = "1.23.2", features = ["derive"] }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.7", optional = true }

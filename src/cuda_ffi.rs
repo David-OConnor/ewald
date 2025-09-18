@@ -2,42 +2,107 @@
 //! (We recommend you use a kernel that combines the short-range Coulomb force with Lennard Jones logic
 //! in your application, instead of using the CPU functionality in this library).
 
+// todo: Organize both this and teh .cu file. REmove unused, make order sensitible, and cyn order.
+
 use std::ffi::c_void;
 
 use rustfft::num_complex::Complex;
 
 unsafe extern "C" {
-    pub(crate) fn spme_make_plan_c2c(
+    pub(crate) fn spme_make_plan_r2c_c2r_many(
         nx: i32,
         ny: i32,
         nz: i32,
         cu_stream: *mut c_void, // CUstream / cudaStream_t
     ) -> *mut c_void;
 
-    pub(crate) fn spme_exec_inverse_3_c2c(
+    pub(crate) fn spme_exec_inverse_ExEyEz_c2r(
         plan: *mut c_void,
         exk: *mut c_void, // cufftComplex*
         eyk: *mut c_void,
         ezk: *mut c_void,
+        ex: *mut c_void,
+        ey: *mut c_void,
+        ez: *mut c_void,
     );
 
-    // pub(crate) fn spme_scale_c2c(
-    //     data: *mut c_void, // cufftComplex*
-    //     n: usize,          // number of complex elements (nx*ny*nz)
-    //     scale: f32,
-    //     cu_stream: *mut c_void,
-    // );
+    pub(crate) fn spme_scale_ExEyEz_after_c2r(
+        ex: *mut c_void,
+        ey: *mut c_void,
+        ez: *mut c_void,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        cu_stream: *mut c_void,
+    );
 
-    // pub(crate) fn spme_make_plan_c2c_batch3(nx: i32, ny: i32, nz: i32, cu_stream: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-    // pub(crate) fn spme_exec_inverse_c2c_batch3(plan: *mut c_void, base: *mut c_void);
+    pub(crate) fn spme_apply_ghat_and_grad_launch(
+        rho: *const c_void,
+        exk: *mut c_void,
+        eyk: *mut c_void,
+        ezk: *mut c_void,
+        kx: *const c_void,
+        ky: *const c_void,
+        kz: *const c_void,
+        bx: *const c_void,
+        by: *const c_void,
+        bz: *const c_void,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        vol: f32,
+        alpha: f32,
+        cu_stream: *mut c_void,
+    );
 
-    pub(crate) fn spme_gather_forces_to_atoms_cplx_launch(
-        pos: *const std::ffi::c_void,
-        exk: *const std::ffi::c_void,
-        eyk: *const std::ffi::c_void,
-        ezk: *const std::ffi::c_void,
-        q: *const std::ffi::c_void,
-        out_f: *mut std::ffi::c_void,
+    pub(crate) fn spme_destroy_plan_r2c_c2r_many(plan: *mut c_void);
+
+    pub(crate) fn spme_energy_half_spectrum_launch(
+        rho_k: *const c_void,
+        kx: *const c_void,
+        ky: *const c_void,
+        kz: *const c_void,
+        bx: *const c_void,
+        by: *const c_void,
+        bz: *const c_void,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        vol: f32,
+        alpha: f32,
+        partial_sums: *mut c_void, // device buffer double[blocks]
+        blocks: i32,
+        threads: i32,
+        cu_stream: *mut c_void,
+    );
+
+    pub(crate) fn spme_scatter_rho_4x4x4_launch(
+        pos: *const c_void,
+        q: *const c_void,
+        rho: *mut c_void,
+        n_atoms: i32,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        lx: f32,
+        ly: f32,
+        lz: f32,
+        cu_stream: *mut c_void,
+    );
+
+    pub(crate) fn spme_exec_forward_r2c(
+        plan: *mut c_void,
+        rho_real: *mut c_void,
+        rho_k: *mut c_void,
+    );
+
+    pub(crate) fn spme_gather_forces_to_atoms_launch(
+        pos: *const c_void,
+        ex: *const c_void,
+        ey: *const c_void,
+        ez: *const c_void,
+        q: *const c_void,
+        out_f: *mut c_void,
         n_atoms: i32,
         nx: i32,
         ny: i32,
@@ -46,29 +111,8 @@ unsafe extern "C" {
         ly: f32,
         lz: f32,
         inv_n: f32,
-        cu_stream: *mut std::ffi::c_void,
+        cu_stream: *mut c_void,
     );
-
-    pub(crate) fn spme_apply_ghat_and_grad_launch(
-        rho: *const std::ffi::c_void,
-        exk: *mut std::ffi::c_void,
-        eyk: *mut std::ffi::c_void,
-        ezk: *mut std::ffi::c_void,
-        kx: *const std::ffi::c_void,
-        ky: *const std::ffi::c_void,
-        kz: *const std::ffi::c_void,
-        bx: *const std::ffi::c_void,
-        by: *const std::ffi::c_void,
-        bz: *const std::ffi::c_void,
-        nx: i32,
-        ny: i32,
-        nz: i32,
-        vol: f32,
-        alpha: f32,
-        cu_stream: *mut std::ffi::c_void,
-    );
-
-    pub(crate) fn spme_destroy_plan(plan: *mut c_void);
 }
 
 /// For CUDA serialization

@@ -16,6 +16,7 @@ extern crate core;
 use std::sync::Arc;
 use std::{
     f32::consts::{PI, TAU},
+    ops::Add,
     time::Instant,
 };
 
@@ -78,35 +79,6 @@ pub struct PmeRecip {
     gpu_tables: Option<GpuTables>,
 }
 
-// impl Default for PmeRecip {
-//     // todo: Rust needs a beter solution for this.
-//
-//     // todo note: The PME planner[s] must be rebuilt if the nx etc dimensions change.
-//     fn default() -> Self {
-//         Self {
-//             nx: 0,
-//             ny: 0,
-//             nz: 0,
-//             lx: 0.,
-//             ly: 0.,
-//             lz: 0.,
-//             vol: 0.,
-//             alpha: 0.,
-//             kx: Vec::new(),
-//             ky: Vec::new(),
-//             kz: Vec::new(),
-//             bmod2_x: Vec::new(),
-//             bmod2_y: Vec::new(),
-//             bmod2_z: Vec::new(),
-//             planner: FftPlanner::new(),
-//             #[cfg(feature = "cuda")]
-//             planner_gpu: std::ptr::null_mut(),
-//             #[cfg(feature = "cuda")]
-//             plan_dims: (0, 0, 0),
-//         }
-//     }
-// }
-
 impl PmeRecip {
     pub fn new(n: (usize, usize, usize), l: (f32, f32, f32), alpha: f32) -> Self {
         assert!(n.0 >= 4 && n.1 >= 4 && n.2 >= 4);
@@ -144,6 +116,34 @@ impl PmeRecip {
             #[cfg(feature = "cuda")]
             gpu_tables: None,
             // ..Default::default()
+        }
+    }
+
+    // keep this in a non-cfg impl block
+    fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
+        let nxny = self.nx * self.ny;
+        for (r, &qi) in pos.iter().zip(q.iter()) {
+            let sx = r.x / self.lx * self.nx as f32;
+            let sy = r.y / self.ly * self.ny as f32;
+            let sz = r.z / self.lz * self.nz as f32;
+
+            let (ix0, wx) = bspline4_weights(sx);
+            let (iy0, wy) = bspline4_weights(sy);
+            let (iz0, wz) = bspline4_weights(sz);
+
+            for a in 0..4 {
+                let ix = wrap(ix0 + a as isize, self.nx);
+                let wxa = wx[a];
+                for b in 0..4 {
+                    let iy = wrap(iy0 + b as isize, self.ny);
+                    let wxy = wxa * wy[b];
+                    for c in 0..4 {
+                        let iz = wrap(iz0 + c as isize, self.nz);
+                        let idx = iz * nxny + iy * self.nx + ix;
+                        rho[idx].re += qi * wxy * wz[c];
+                    }
+                }
+            }
         }
     }
 
@@ -346,90 +346,98 @@ impl PmeRecip {
     ) -> (Vec<Vec3>, f32) {
         assert_eq!(pos.len(), q.len());
 
-        let n_pts = self.nx * self.ny * self.nz;
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let n_real = nx * ny * nz;
+        let n_cmplx = nx * ny * (nz / 2 + 1); // half-spectrum length
+        let complex_len = n_cmplx * 2; // (re,im) interleaved
 
-        // spread + forward FFT on CPU (unchanged)
-        let mut rho = vec![rustfft::num_complex::Complex::<f32>::new(0.0, 0.0); n_pts];
+        // Contiguous real buffer: [ex | ey | ez]
+        let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
+        let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
+        let base_r = base_r_ptr as usize;
+        let stride_r_bytes = n_real * std::mem::size_of::<f32>();
+        let ex_ptr = base_r as *mut std::ffi::c_void;
+        let ey_ptr = (base_r + stride_r_bytes) as *mut std::ffi::c_void;
+        let ez_ptr = (base_r + 2 * stride_r_bytes) as *mut std::ffi::c_void;
 
-        self.spread_charges(pos, q, &mut rho);
-        fft3_inplace(
-            &mut rho,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            true,
-        );
-
-        let energy: f32 = {
-            let (nx, ny, nz) = (self.nx, self.ny, self.nz);
-            let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
-            let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
-            let vol = self.vol;
-            let alpha = self.alpha;
-            let mut acc = 0.0f64;
-
-            for idx in 0..(nx * ny * nz) {
-                let ix = idx % nx;
-                let iy = (idx / nx) % ny;
-                let iz = idx / (nx * ny);
-
-                let kxv = kx[ix] as f64;
-                let kyv = ky[iy] as f64;
-                let kzv = kz[iz] as f64;
-                let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
-                if k2 == 0.0 {
-                    continue;
-                }
-
-                let bmod2 = (bx[ix] as f64) * (by[iy] as f64) * (bz[iz] as f64);
-                if bmod2 <= 1e-10 {
-                    continue;
-                }
-
-                let ghat = (2.0f64 * std::f64::consts::PI * 2.0 / (vol as f64))
-                    * (-k2 / (4.0 * (alpha as f64) * (alpha as f64))).exp()
-                    / (k2 * bmod2);
-
-                let rr = rho[idx].re as f64;
-                let ii = rho[idx].im as f64;
-                let mag2 = rr * rr + ii * ii;
-
-                acc += 0.5 * ghat * mag2;
-            }
-            acc as f32
-        };
-
-        use bytemuck::cast_slice;
-
-        // H2D: rho(k) once
-        let rho_d = stream.memcpy_stod(&flatten_cplx_vec(&rho)).unwrap();
-
-        // k-space E buffers (complex) on device
-        let exk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
-        let eyk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
-        let ezk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
+        // Contiguous complex buffer: [exk | eyk | ezk]
+        let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
+        let (base_ptr, _) = exeyezk_d.device_ptr(stream);
+        let base = base_ptr as usize;
+        let stride_bytes = complex_len * std::mem::size_of::<f32>();
+        let exk_ptr = base as *mut std::ffi::c_void;
+        let eyk_ptr = (base + stride_bytes) as *mut std::ffi::c_void;
+        let ezk_ptr = (base + 2 * stride_bytes) as *mut std::ffi::c_void;
 
         self.ensure_gpu_plan(stream);
         self.ensure_gpu_tables(stream);
-
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
-        let (rho_ptr, _gr) = rho_d.device_ptr(stream);
-        let (exk_ptr, _g1) = exk_d.device_ptr(stream);
-        let (eyk_ptr, _g2) = eyk_d.device_ptr(stream);
-        let (ezk_ptr, _g3) = ezk_d.device_ptr(stream);
-
+        // Device tables
         let tabs = self.gpu_tables.as_ref().unwrap();
-        let (kx_ptr, _tkx) = tabs.kx.device_ptr(stream);
-        let (ky_ptr, _tky) = tabs.ky.device_ptr(stream);
-        let (kz_ptr, _tkz) = tabs.kz.device_ptr(stream);
-        let (bx_ptr, _tbx) = tabs.bx.device_ptr(stream);
-        let (by_ptr, _tby) = tabs.by.device_ptr(stream);
-        let (bz_ptr, _tbz) = tabs.bz.device_ptr(stream);
+        let (kx_ptr, _) = tabs.kx.device_ptr(stream);
+        let (ky_ptr, _) = tabs.ky.device_ptr(stream);
+        let (kz_ptr, _) = tabs.kz.device_ptr(stream);
+        let (bx_ptr, _) = tabs.bx.device_ptr(stream);
+        let (by_ptr, _) = tabs.by.device_ptr(stream);
+        let (bz_ptr, _) = tabs.bz.device_ptr(stream);
 
+        // H2D: positions & charges (flattened)
+        let pos_flat: Vec<f32> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        let pos_d: CudaSlice<f32> = stream.memcpy_stod(&pos_flat).unwrap();
+        let q_d: CudaSlice<f32> = stream.memcpy_stod(q).unwrap();
+        let (pos_ptr, _) = pos_d.device_ptr(stream);
+        let (q_ptr, _) = q_d.device_ptr(stream);
+
+        // rho_real on device
+        let rho_real_d: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let (rho_real_ptr, _) = rho_real_d.device_ptr(stream);
+
+        // Scatter on GPU
         unsafe {
-            // k-space multiply on GPU
+            cuda_ffi::spme_scatter_rho_4x4x4_launch(
+                pos_ptr as *const _,
+                q_ptr as *const _,
+                rho_real_ptr as *mut _,
+                pos.len() as i32,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.lx,
+                self.ly,
+                self.lz,
+                cu_stream,
+            );
+        }
+
+        // rho(k) (half-spectrum) on device
+        let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        let (rho_k_ptr, _) = rho_k_d.device_ptr(stream);
+
+        // Make/refresh R2C/C2R-many plan
+        if self.planner_gpu.is_null() || self.plan_dims != (nx as i32, ny as i32, nz as i32) {
+            unsafe {
+                if !self.planner_gpu.is_null() {
+                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                }
+                self.planner_gpu = cuda_ffi::spme_make_plan_r2c_c2r_many(
+                    nx as i32, ny as i32, nz as i32, cu_stream,
+                );
+                self.plan_dims = (nx as i32, ny as i32, nz as i32);
+            }
+        }
+
+        // Forward FFT on GPU: real -> half complex
+        unsafe {
+            cuda_ffi::spme_exec_forward_r2c(
+                self.planner_gpu,
+                rho_real_ptr as *mut _,
+                rho_k_ptr as *mut _,
+            );
+
+            // Apply G(k) and gradient to get Exk/Eyk/Ezk
             cuda_ffi::spme_apply_ghat_and_grad_launch(
-                rho_ptr as *const _,
+                rho_k_ptr as *const _,
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
                 ezk_ptr as *mut _,
@@ -439,64 +447,47 @@ impl PmeRecip {
                 bx_ptr as *const _,
                 by_ptr as *const _,
                 bz_ptr as *const _,
-                self.nx as i32,
-                self.ny as i32,
-                self.nz as i32,
+                nx as i32,
+                ny as i32,
+                nz as i32,
                 self.vol,
                 self.alpha,
                 cu_stream,
             );
 
-            // 3 inverse FFTs on GPU (in-place)
-            cuda_ffi::spme_exec_inverse_3_c2c(
+            // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
+            cuda_ffi::spme_exec_inverse_ExEyEz_c2r(
                 self.planner_gpu,
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
                 ezk_ptr as *mut _,
+                ex_ptr as *mut _,
+                ey_ptr as *mut _,
+                ez_ptr as *mut _,
+            );
+
+            // Scale by 1/N once here
+            cuda_ffi::spme_scale_ExEyEz_after_c2r(
+                ex_ptr, ey_ptr, ez_ptr, nx as i32, ny as i32, nz as i32, cu_stream,
             );
         }
 
-        // H2D: positions and charges
-        #[repr(C)]
-        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-        struct F3 {
-            x: f32,
-            y: f32,
-            z: f32,
-        }
-        let pos_packed: Vec<F3> = pos
-            .iter()
-            .map(|p| F3 {
-                x: p.x,
-                y: p.y,
-                z: p.z,
-            })
-            .collect();
-        let pos_d: CudaSlice<f32> = stream.memcpy_stod(cast_slice(&pos_packed)).unwrap();
-
-        let q_d = stream.memcpy_stod(q).unwrap();
-
-        // Out forces (device)
+        // Gather forces F = q * E
         let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
-
-        let (pos_ptr, _gp) = pos_d.device_ptr(stream);
-        let (q_ptr, _gq) = q_d.device_ptr(stream);
-        let (f_ptr, _gf) = f_d.device_ptr(stream);
-
-        let inv_n = 1.0f32 / (self.nx as f32 * self.ny as f32 * self.nz as f32);
-
+        let (f_ptr, _) = f_d.device_ptr(stream);
+        let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
         unsafe {
-            cuda_ffi::spme_gather_forces_to_atoms_cplx_launch(
+            cuda_ffi::spme_gather_forces_to_atoms_launch(
                 pos_ptr as *const _,
-                exk_ptr as *const _,
-                eyk_ptr as *const _,
-                ezk_ptr as *const _,
+                ex_ptr as *const _,
+                ey_ptr as *const _,
+                ez_ptr as *const _,
                 q_ptr as *const _,
                 f_ptr as *mut _,
                 pos.len() as i32,
-                self.nx as i32,
-                self.ny as i32,
-                self.nz as i32,
+                nx as i32,
+                ny as i32,
+                nz as i32,
                 self.lx,
                 self.ly,
                 self.lz,
@@ -505,7 +496,41 @@ impl PmeRecip {
             );
         }
 
-        // D2H: forces only
+        // Energy (half spectrum)
+        let threads = 256i32;
+        let blocks = {
+            let n = n_cmplx as i32;
+            (n + threads - 1) / threads
+        };
+        let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();
+        let (partial_ptr, _) = partial_d.device_ptr(stream);
+        unsafe {
+            cuda_ffi::spme_energy_half_spectrum_launch(
+                rho_k_ptr as *const _,
+                kx_ptr as *const _,
+                ky_ptr as *const _,
+                kz_ptr as *const _,
+                bx_ptr as *const _,
+                by_ptr as *const _,
+                bz_ptr as *const _,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.vol,
+                self.alpha,
+                partial_ptr as *mut _,
+                blocks,
+                threads,
+                cu_stream,
+            );
+        }
+        let energy = stream
+            .memcpy_dtov(&partial_d)
+            .unwrap()
+            .into_iter()
+            .sum::<f64>() as f32;
+
+        // D2H forces
         let f_host: Vec<f32> = stream.memcpy_dtov(&f_d).unwrap();
         let mut f = Vec::with_capacity(pos.len());
         for i in 0..pos.len() {
@@ -517,37 +542,6 @@ impl PmeRecip {
         }
 
         (f, energy)
-    }
-
-    fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
-        let nxny = self.nx * self.ny;
-        for (r, &qi) in pos.iter().zip(q.iter()) {
-            // fractional grid coords
-            let sx = r.x / self.lx * self.nx as f32;
-            let sy = r.y / self.ly * self.ny as f32;
-            let sz = r.z / self.lz * self.nz as f32;
-
-            let (ix0, wx) = bspline4_weights(sx);
-            let (iy0, wy) = bspline4_weights(sy);
-            let (iz0, wz) = bspline4_weights(sz);
-
-            for a in 0..4 {
-                let ix = wrap(ix0 + a as isize, self.nx);
-                let wxa = wx[a];
-
-                for b in 0..4 {
-                    let iy = wrap(iy0 + b as isize, self.ny);
-                    let wyb = wy[b];
-                    let wxy = wxa * wyb;
-
-                    for c in 0..4 {
-                        let iz = wrap(iz0 + c as isize, self.nz);
-                        let idx = iz * nxny + iy * self.nx + ix;
-                        rho[idx].re += qi * wxy * wz[c];
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -824,12 +818,12 @@ impl PmeRecip {
         unsafe {
             if self.planner_gpu.is_null() || self.plan_dims != dims {
                 if !self.planner_gpu.is_null() {
-                    cuda_ffi::spme_destroy_plan(self.planner_gpu);
+                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
                     self.planner_gpu = std::ptr::null_mut();
                 }
-                self.planner_gpu = cuda_ffi::spme_make_plan_c2c(dims.0, dims.1, dims.2, raw_stream);
+                self.planner_gpu =
+                    cuda_ffi::spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
                 self.plan_dims = dims;
-                // dims changed → force re-upload of GPU tables
                 #[cfg(feature = "cuda")]
                 {
                     self.gpu_tables = None;
@@ -844,7 +838,7 @@ impl Drop for PmeRecip {
     fn drop(&mut self) {
         unsafe {
             if !self.planner_gpu.is_null() {
-                cuda_ffi::spme_destroy_plan(self.planner_gpu);
+                cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
                 self.planner_gpu = std::ptr::null_mut();
             }
         }
@@ -853,12 +847,12 @@ impl Drop for PmeRecip {
 
 #[cfg(feature = "cuda")]
 struct GpuTables {
-    kx: cudarc::driver::CudaSlice<f32>,
-    ky: cudarc::driver::CudaSlice<f32>,
-    kz: cudarc::driver::CudaSlice<f32>,
-    bx: cudarc::driver::CudaSlice<f32>,
-    by: cudarc::driver::CudaSlice<f32>,
-    bz: cudarc::driver::CudaSlice<f32>,
+    kx: CudaSlice<f32>,
+    ky: CudaSlice<f32>,
+    kz: CudaSlice<f32>,
+    bx: CudaSlice<f32>,
+    by: CudaSlice<f32>,
+    bz: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
