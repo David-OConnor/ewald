@@ -21,11 +21,51 @@ unsafe extern "C" {
         ezk: *mut c_void,
     );
 
-    pub(crate) fn spme_scale_c2c(
-        data: *mut c_void, // cufftComplex*
-        n: usize,          // number of complex elements (nx*ny*nz)
-        scale: f32,
-        cu_stream: *mut c_void,
+    // pub(crate) fn spme_scale_c2c(
+    //     data: *mut c_void, // cufftComplex*
+    //     n: usize,          // number of complex elements (nx*ny*nz)
+    //     scale: f32,
+    //     cu_stream: *mut c_void,
+    // );
+
+    // pub(crate) fn spme_make_plan_c2c_batch3(nx: i32, ny: i32, nz: i32, cu_stream: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    // pub(crate) fn spme_exec_inverse_c2c_batch3(plan: *mut c_void, base: *mut c_void);
+
+    pub(crate) fn spme_gather_forces_to_atoms_cplx_launch(
+        pos: *const std::ffi::c_void,
+        exk: *const std::ffi::c_void,
+        eyk: *const std::ffi::c_void,
+        ezk: *const std::ffi::c_void,
+        q: *const std::ffi::c_void,
+        out_f: *mut std::ffi::c_void,
+        n_atoms: i32,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        lx: f32,
+        ly: f32,
+        lz: f32,
+        inv_n: f32,
+        cu_stream: *mut std::ffi::c_void,
+    );
+
+    pub(crate) fn spme_apply_ghat_and_grad_launch(
+        rho: *const std::ffi::c_void,
+        exk: *mut std::ffi::c_void,
+        eyk: *mut std::ffi::c_void,
+        ezk: *mut std::ffi::c_void,
+        kx: *const std::ffi::c_void,
+        ky: *const std::ffi::c_void,
+        kz: *const std::ffi::c_void,
+        bx: *const std::ffi::c_void,
+        by: *const std::ffi::c_void,
+        bz: *const std::ffi::c_void,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        vol: f32,
+        alpha: f32,
+        cu_stream: *mut std::ffi::c_void,
     );
 
     pub(crate) fn spme_destroy_plan(plan: *mut c_void);

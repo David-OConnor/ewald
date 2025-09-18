@@ -19,11 +19,15 @@ use std::{
     time::Instant,
 };
 
+// todo: RM ByteMuck.
+use bytemuck::cast_slice;
+
 #[cfg(feature = "cuda")]
 mod cuda_ffi;
 
 #[cfg(feature = "cuda")]
 use cuda_ffi::{flatten_cplx_vec, unflatten_cplx_vec};
+use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaModule, CudaStream, DevicePtr, PushKernelArg, sys::CUstream};
 // todo: This may be a good candidate for a standalone library.
@@ -70,6 +74,8 @@ pub struct PmeRecip {
     // todo: Do you want this? Or is it the same as nx, ny, nz?
     #[cfg(feature = "cuda")]
     plan_dims: (i32, i32, i32),
+    #[cfg(feature = "cuda")]
+    gpu_tables: Option<GpuTables>,
 }
 
 // impl Default for PmeRecip {
@@ -135,6 +141,8 @@ impl PmeRecip {
             planner_gpu: std::ptr::null_mut(),
             #[cfg(feature = "cuda")]
             plan_dims: (0, 0, 0),
+            #[cfg(feature = "cuda")]
+            gpu_tables: None,
             // ..Default::default()
         }
     }
@@ -329,11 +337,6 @@ impl PmeRecip {
     }
 
     #[cfg(feature = "cuda")]
-    /// Compute reciprocal-space forces. Positions must be in the primary box [0,L) per axis.
-    /// Note that this only uses GPU for the FFT part, but this is dominates computation time.
-    ///
-    /// This isn't calling a custom CUDA kernel, to iterate over an array, It leverages host-side
-    /// CUDA code, which calls cuFFT.
     pub fn forces_gpu(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -344,12 +347,11 @@ impl PmeRecip {
         assert_eq!(pos.len(), q.len());
 
         let n_pts = self.nx * self.ny * self.nz;
-        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
+
+        // spread + forward FFT on CPU (unchanged)
+        let mut rho = vec![rustfft::num_complex::Complex::<f32>::new(0.0, 0.0); n_pts];
+
         self.spread_charges(pos, q, &mut rho);
-
-        let start = Instant::now();
-
-        // todo: Move this to the GPU as well.
         fft3_inplace(
             &mut rho,
             (self.nx, self.ny, self.nz),
@@ -357,81 +359,162 @@ impl PmeRecip {
             true,
         );
 
-        let elapsed = start.elapsed();
-        println!("SPME FFT A: {} ms", elapsed.as_millis());
+        let energy: f32 = {
+            let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+            let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
+            let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
+            let vol = self.vol;
+            let alpha = self.alpha;
+            let mut acc = 0.0f64;
 
-        let (mut exk, mut eyk, mut ezk, energy) = self.forces_part_b(&rho, n_pts);
+            for idx in 0..(nx * ny * nz) {
+                let ix = idx % nx;
+                let iy = (idx / nx) % ny;
+                let iz = idx / (nx * ny);
 
-        // let mut exk_test = exk.clone();
-        // // todo temp. Note: The tests disagree, and the CPU version is reporting 0s?
-        // fft3_inplace(
-        //     &mut exk_test,
-        //     (self.nx, self.ny, self.nz),
-        //     &mut self.planner,
-        //     false,
-        // );
+                let kxv = kx[ix] as f64;
+                let kyv = ky[iy] as f64;
+                let kzv = kz[iz] as f64;
+                let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
+                if k2 == 0.0 {
+                    continue;
+                }
 
-        let start = Instant::now();
-        // Run the inverse FFTs on the GPU.
-        {
-            let exk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&exk)).unwrap();
-            let eyk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&eyk)).unwrap();
-            let ezk_gpu = stream.memcpy_stod(&flatten_cplx_vec(&ezk)).unwrap();
+                let bmod2 = (bx[ix] as f64) * (by[iy] as f64) * (bz[iz] as f64);
+                if bmod2 <= 1e-10 {
+                    continue;
+                }
 
-            // m// Potential energy.
-            // let energy_gpu = stream.memcpy_stod(&[0.0f64]).unwrap();
+                let ghat = (2.0f64 * std::f64::consts::PI * 2.0 / (vol as f64))
+                    * (-k2 / (4.0 * (alpha as f64) * (alpha as f64))).exp()
+                    / (k2 * bmod2);
 
-            // Get raw CUdeviceptrs tied to this stream.
-            // IMPORTANT: keep the guards alive until after the FFI call returns.
-            let (exk_ptr, _exk_guard) = exk_gpu.device_ptr(stream);
-            let (eyk_ptr, _eyk_guard) = eyk_gpu.device_ptr(stream);
-            let (ezk_ptr, _ezk_guard) = ezk_gpu.device_ptr(stream);
-            // let (energy_ptr, _energy_guard) = energy_gpu.device_ptr(stream);
+                let rr = rho[idx].re as f64;
+                let ii = rho[idx].im as f64;
+                let mag2 = rr * rr + ii * ii;
 
-            self.ensure_gpu_plan(stream);
-
-            let cu_stream: CUstream = stream.cu_stream();
-            let raw_stream = cu_stream as *mut std::ffi::c_void;
-            let n_complex = self.nx * self.ny * self.nz;
-
-            let scale = 1.0f32 / (self.nx as f32 * self.ny as f32 * self.nz as f32);
-
-            // Call the cuFFT wrapper (still runs on GPU; invoked from host)
-            // ---- E) Run three inverse FFTs + 1/N scaling on GPU ----
-            unsafe {
-                cuda_ffi::spme_exec_inverse_3_c2c(
-                    self.planner_gpu,
-                    exk_ptr as *mut std::ffi::c_void,
-                    eyk_ptr as *mut std::ffi::c_void,
-                    ezk_ptr as *mut std::ffi::c_void,
-                );
-
-                // Apply normalization expected by your CPU path
-                cuda_ffi::spme_scale_c2c(exk_ptr as *mut _, n_complex, scale, raw_stream);
-                cuda_ffi::spme_scale_c2c(eyk_ptr as *mut _, n_complex, scale, raw_stream);
-                cuda_ffi::spme_scale_c2c(ezk_ptr as *mut _, n_complex, scale, raw_stream);
+                acc += 0.5 * ghat * mag2;
             }
+            acc as f32
+        };
 
-            // todo: Rerquired?
-            stream.synchronize().expect("stream sync");
+        use bytemuck::cast_slice;
 
-            exk = unflatten_cplx_vec(&stream.memcpy_dtov(&exk_gpu).unwrap());
-            eyk = unflatten_cplx_vec(&stream.memcpy_dtov(&eyk_gpu).unwrap());
-            ezk = unflatten_cplx_vec(&stream.memcpy_dtov(&ezk_gpu).unwrap());
-            // energy = stream.memcpy_dtov(&energy_gpu).unwrap()[0];
+        // H2D: rho(k) once
+        let rho_d = stream.memcpy_stod(&flatten_cplx_vec(&rho)).unwrap();
+
+        // k-space E buffers (complex) on device
+        let exk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
+        let eyk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
+        let ezk_d: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros(n_pts * 2).unwrap();
+
+        self.ensure_gpu_plan(stream);
+        self.ensure_gpu_tables(stream);
+
+        let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
+
+        let (rho_ptr, _gr) = rho_d.device_ptr(stream);
+        let (exk_ptr, _g1) = exk_d.device_ptr(stream);
+        let (eyk_ptr, _g2) = eyk_d.device_ptr(stream);
+        let (ezk_ptr, _g3) = ezk_d.device_ptr(stream);
+
+        let tabs = self.gpu_tables.as_ref().unwrap();
+        let (kx_ptr, _tkx) = tabs.kx.device_ptr(stream);
+        let (ky_ptr, _tky) = tabs.ky.device_ptr(stream);
+        let (kz_ptr, _tkz) = tabs.kz.device_ptr(stream);
+        let (bx_ptr, _tbx) = tabs.bx.device_ptr(stream);
+        let (by_ptr, _tby) = tabs.by.device_ptr(stream);
+        let (bz_ptr, _tbz) = tabs.bz.device_ptr(stream);
+
+        unsafe {
+            // k-space multiply on GPU
+            cuda_ffi::spme_apply_ghat_and_grad_launch(
+                rho_ptr as *const _,
+                exk_ptr as *mut _,
+                eyk_ptr as *mut _,
+                ezk_ptr as *mut _,
+                kx_ptr as *const _,
+                ky_ptr as *const _,
+                kz_ptr as *const _,
+                bx_ptr as *const _,
+                by_ptr as *const _,
+                bz_ptr as *const _,
+                self.nx as i32,
+                self.ny as i32,
+                self.nz as i32,
+                self.vol,
+                self.alpha,
+                cu_stream,
+            );
+
+            // 3 inverse FFTs on GPU (in-place)
+            cuda_ffi::spme_exec_inverse_3_c2c(
+                self.planner_gpu,
+                exk_ptr as *mut _,
+                eyk_ptr as *mut _,
+                ezk_ptr as *mut _,
+            );
         }
 
-        // todo temp. And, this test is... showing 0 for the CPU values?
-        // println!("CPU: {:.4?}", &exk_test[0..10]);
-        println!("GPU exk[..10] = {:?}", &exk[..10]);
+        // H2D: positions and charges
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct F3 {
+            x: f32,
+            y: f32,
+            z: f32,
+        }
+        let pos_packed: Vec<F3> = pos
+            .iter()
+            .map(|p| F3 {
+                x: p.x,
+                y: p.y,
+                z: p.z,
+            })
+            .collect();
+        let pos_d: CudaSlice<f32> = stream.memcpy_stod(cast_slice(&pos_packed)).unwrap();
 
-        let elapsed = start.elapsed();
-        println!("SPME FFT B: {} ms", elapsed.as_millis());
+        let q_d = stream.memcpy_stod(q).unwrap();
 
-        // let start = Instant::now();
-        let f = self.forces_part_c(pos, &exk, &eyk, &ezk, q);
-        // let elapsed = start.elapsed();
-        // println!("SPME recip B: {} us", elapsed.as_millis());
+        // Out forces (device)
+        let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
+
+        let (pos_ptr, _gp) = pos_d.device_ptr(stream);
+        let (q_ptr, _gq) = q_d.device_ptr(stream);
+        let (f_ptr, _gf) = f_d.device_ptr(stream);
+
+        let inv_n = 1.0f32 / (self.nx as f32 * self.ny as f32 * self.nz as f32);
+
+        unsafe {
+            cuda_ffi::spme_gather_forces_to_atoms_cplx_launch(
+                pos_ptr as *const _,
+                exk_ptr as *const _,
+                eyk_ptr as *const _,
+                ezk_ptr as *const _,
+                q_ptr as *const _,
+                f_ptr as *mut _,
+                pos.len() as i32,
+                self.nx as i32,
+                self.ny as i32,
+                self.nz as i32,
+                self.lx,
+                self.ly,
+                self.lz,
+                inv_n,
+                cu_stream,
+            );
+        }
+
+        // D2H: forces only
+        let f_host: Vec<f32> = stream.memcpy_dtov(&f_d).unwrap();
+        let mut f = Vec::with_capacity(pos.len());
+        for i in 0..pos.len() {
+            f.push(Vec3 {
+                x: f_host[i * 3 + 0],
+                y: f_host[i * 3 + 1],
+                z: f_host[i * 3 + 2],
+            });
+        }
 
         (f, energy)
     }
@@ -735,7 +818,6 @@ impl PmeRecip {
         use std::ffi::c_void;
         let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
 
-        // Obtain the raw CUstream from cudarc:
         let cu_stream: CUstream = stream.cu_stream();
         let raw_stream: *mut c_void = cu_stream as *mut c_void;
 
@@ -747,6 +829,11 @@ impl PmeRecip {
                 }
                 self.planner_gpu = cuda_ffi::spme_make_plan_c2c(dims.0, dims.1, dims.2, raw_stream);
                 self.plan_dims = dims;
+                // dims changed → force re-upload of GPU tables
+                #[cfg(feature = "cuda")]
+                {
+                    self.gpu_tables = None;
+                }
             }
         }
     }
@@ -760,6 +847,36 @@ impl Drop for PmeRecip {
                 cuda_ffi::spme_destroy_plan(self.planner_gpu);
                 self.planner_gpu = std::ptr::null_mut();
             }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct GpuTables {
+    kx: cudarc::driver::CudaSlice<f32>,
+    ky: cudarc::driver::CudaSlice<f32>,
+    kz: cudarc::driver::CudaSlice<f32>,
+    bx: cudarc::driver::CudaSlice<f32>,
+    by: cudarc::driver::CudaSlice<f32>,
+    bz: cudarc::driver::CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl PmeRecip {
+    fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
+        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
+        if self.plan_dims != dims {
+            return;
+        } // ensure plan first
+        if self.gpu_tables.is_none() {
+            self.gpu_tables = Some(GpuTables {
+                kx: stream.memcpy_stod(&self.kx).unwrap(),
+                ky: stream.memcpy_stod(&self.ky).unwrap(),
+                kz: stream.memcpy_stod(&self.kz).unwrap(),
+                bx: stream.memcpy_stod(&self.bmod2_x).unwrap(),
+                by: stream.memcpy_stod(&self.bmod2_y).unwrap(),
+                bz: stream.memcpy_stod(&self.bmod2_z).unwrap(),
+            });
         }
     }
 }
