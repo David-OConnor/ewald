@@ -8,7 +8,7 @@
 
 [Original paper describing the SPME method](https://biomolmd.org/mw/images/e/e0/Spme.pdf)
 
-This library is for Python and Rust.
+This library is for Python and Rust. Supports GPU, or thread-pooled CPU.
 
 This has applications primarily in structural biology. For example, molecular dynamics. Compared to other
 n-body approximations for long-range forces, this has utility when periodic bounday conditions are used.
@@ -21,7 +21,7 @@ the `cuda` feature in `Cargo.toml`.
 Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
-Uses f32 for Lennard Jones and Coulomb. Energy sums are computed as f64.
+Uses f32 for Lennard Jones and Coulomb interactions. Energy sums are computed as f64.
 
 Here's an example of use. The Python API is equivalent.
 

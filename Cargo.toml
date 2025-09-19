@@ -1,6 +1,6 @@
 [package]
 name = "ewald"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 authors = ["David O'Connor <the_alchemist@fastmail.com>"]
 description = "Ewald SPME force calculations"
@@ -31,8 +31,6 @@ rayon = "1.10.0"  # Parallel execution on CPU using thread pools.
 cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-13000"], optional=true }
 [target.'cfg(target_os = "windows")'.dependencies]
 cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13000"], optional=true }
-
-bytemuck = { version = "1.23.2", features = ["derive"] }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.7", optional = true }
