@@ -8,19 +8,20 @@
 
 [Original paper describing the SPME method](https://biomolmd.org/mw/images/e/e0/Spme.pdf)
 
-This library is for Python and Rust.
+This library is for Python and Rust. Supports GPU, or thread-pooled CPU.
 
 This has applications primarily in structural biology. For example, molecular dynamics. Compared to other
 n-body approximations for long-range forces, this has utility when periodic bounday conditions are used.
 If not using these, for example in cosmology simulations, consider Barnes Hut, or Fast Multipole Methods (FMM)
 instead.
 
-Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), and CUDA (via CUDARC) are planned. For now, you may wish to write
-custom GPU kernels, using this lib as a reference.
+Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable
+the `cuda` feature in `Cargo.toml`.
 
-WIP code for using the SPME/recip interaction on GPU.
+Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
+the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
-Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus).
+Uses f32 for Lennard Jones and Coulomb interactions. Energy sums are computed as f64.
 
 Here's an example of use. The Python API is equivalent.
 
@@ -28,11 +29,11 @@ Here's an example of use. The Python API is equivalent.
 use rayon::prelude::*;
 use ewald::{force_coulomb_ewald_real, force_coulomb_ewald_real};
 
-const LONG_RANGE_CUTOFF: f64 = 10.0;
+const LONG_RANGE_CUTOFF: f32 = 10.0;
 
 // A bigger α means more damping, and a smaller real-space contribution. (Cheaper real), but larger
 // reciprocal load.
-const EWALD_ALPHA: f64 = 0.35; // Å^-1. 0.35 is good for cutoff = 10.
+const EWALD_ALPHA: f32 = 0.35; // Å^-1. 0.35 is good for cutoff = 10.
 
 impl System {
     // Primary application:

@@ -23,14 +23,11 @@ use std::{
 mod cuda_ffi;
 
 #[cfg(feature = "cuda")]
-use cuda_ffi::{flatten_cplx_vec, unflatten_cplx_vec};
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaModule, CudaStream, DevicePtr, PushKernelArg, sys::CUstream};
 // todo: This may be a good candidate for a standalone library.
 use lin_alg::f32::Vec3;
-#[cfg(target_arch = "x86_64")]
-use lin_alg::f64::{Vec3x8, f64x8};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
