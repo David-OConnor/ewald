@@ -3,9 +3,9 @@
 #include <cufftXt.h>
 #include <cstdio>
 
+__device__ __forceinline__ int wrap_i(int a, int n) { a %= n; return (a < 0) ? a + n : a; }
 
-// Minimal CUFFT error checker.
-// If you prefer fail-fast, you can add `abort();` after the printf.
+// A minimal CUFFT error checker.
 #ifndef CUFFT_CHECK
 #define CUFFT_CHECK(call)                                                   \
   do {                                                                      \
@@ -16,18 +16,6 @@
   } while (0)
 #endif
 
-__global__ void scale3(float* ex, float* ey, float* ez, size_t n, float s) {
-    size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-    if (i < n) {
-        ex[i] *= s; ey[i] *= s; ez[i] *= s;
-    }
-}
-
-
-
-// put this at file scope (not inside a kernel)
-__device__ __forceinline__ int wrap_i(int a, int n) { a %= n; return (a < 0) ? a + n : a; }
-
 struct PlanWrap {
     cufftHandle plan_r2c;
     cufftHandle plan_c2r_many; // batch=3 for exk, eyk, ezk
@@ -36,6 +24,13 @@ struct PlanWrap {
     int nx, ny, nz;
     cudaStream_t stream;
 };
+
+__global__ void scale3(float* ex, float* ey, float* ez, size_t n, float s) {
+    size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    if (i < n) {
+        ex[i] *= s; ey[i] *= s; ez[i] *= s;
+    }
+}
 
 extern "C"
 void* spme_make_plan_r2c_c2r_many(int nx, int ny, int nz, void* cu_stream) {

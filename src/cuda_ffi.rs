@@ -1,6 +1,5 @@
-//! We use *host-side* CUDA functions for long-range reciprical FFTs; not just a device kernel.
-//! (We recommend you use a kernel that combines the short-range Coulomb force with Lennard Jones logic
-//! in your application, instead of using the CPU functionality in this library).
+//! We use *host-side* CUDA functions for long-range reciprical FFTs. This module contains FFI
+//! bindings between the rust code, and CUDA FFI functions.
 
 // todo: Organize both this and teh .cu file. REmove unused, make order sensitible, and cyn order.
 
@@ -13,7 +12,7 @@ unsafe extern "C" {
         nx: i32,
         ny: i32,
         nz: i32,
-        cu_stream: *mut c_void, // CUstream / cudaStream_t
+        cu_stream: *mut c_void,
     ) -> *mut c_void;
 
     pub(crate) fn spme_exec_inverse_ExEyEz_c2r(
@@ -113,27 +112,4 @@ unsafe extern "C" {
         inv_n: f32,
         cu_stream: *mut c_void,
     );
-}
-
-/// For CUDA serialization
-pub(crate) fn flatten_cplx_vec(v: &[Complex<f32>]) -> Vec<f32> {
-    let mut result = Vec::with_capacity(v.len() * 2);
-
-    for v_ in v {
-        result.push(v_.re);
-        result.push(v_.im);
-    }
-
-    result
-}
-
-/// For CUDA deserialization
-pub(crate) fn unflatten_cplx_vec(v: &[f32]) -> Vec<Complex<f32>> {
-    let mut result = Vec::with_capacity(v.len() / 2);
-
-    for i in 0..v.len() / 2 {
-        result.push(Complex::new(v[i * 2], v[i * 2 + 1]));
-    }
-
-    result
 }
