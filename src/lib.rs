@@ -2,22 +2,20 @@
 #![allow(mixed_script_confusables)]
 #![allow(confusable_idents)]
 #![allow(clippy::needless_range_loop)]
+#![allow(clippy::excessive_precision)]
 // #![feature(core_float_math)] When stable
 
 //! For Smooth-Particle-Mesh Ewald; a standard approximation for Coulomb forces in MD.
 //! We use this to handle periodic boundary conditions properly, which we use to take the
-//! water molecules into account.
-
-// todo: Ask about where you should use f64!
+//! water molecules into account. See the Readme for details. The API is split into
+//! two main parts: A standalone function to calculate short-range force, and
+//! a struct with forces method for long-range reciprical forces.
 
 extern crate core;
 
+use std::f32::consts::{PI, TAU};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
-use std::{
-    f32::consts::{PI, TAU},
-    ops::Add,
-};
 
 #[cfg(feature = "cuda")]
 mod cuda_ffi;
@@ -26,7 +24,6 @@ mod cuda_ffi;
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaModule, CudaStream, DevicePtr, sys::CUstream};
-// todo: This may be a good candidate for a standalone library.
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -140,13 +137,21 @@ impl PmeRecip {
         }
     }
 
-    /// Helper to reduce DRY between GPU and CPU variants. Also returns potential energy.
-    /// Note: Parallelization here doesn't seem to have much effect.
-    fn forces_part_b(
-        &self,
-        rho: &[Complex_],
-        n_pts: usize,
-    ) -> (Vec<Complex_>, Vec<Complex_>, Vec<Complex_>, f32) {
+    /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
+    pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
+        assert_eq!(posits.len(), q.len());
+
+        let n_pts = self.nx * self.ny * self.nz;
+        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
+        self.spread_charges(posits, q, &mut rho);
+
+        fft3_inplace(
+            &mut rho,
+            (self.nx, self.ny, self.nz),
+            &mut self.planner,
+            true,
+        );
+
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (nx, ny, _nz) = (self.nx, self.ny, self.nz);
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -207,20 +212,29 @@ impl PmeRecip {
             })
             .sum();
 
-        (exk, eyk, ezk, energy as f32)
-    }
+        // Note: These FFTs are the biggest time bottleneck.
+        // let start = Instant::now();
+        // Inverse FFT to real-space E grids
+        fft3_inplace(
+            &mut exk,
+            (self.nx, self.ny, self.nz),
+            &mut self.planner,
+            false,
+        );
+        fft3_inplace(
+            &mut eyk,
+            (self.nx, self.ny, self.nz),
+            &mut self.planner,
+            false,
+        );
+        fft3_inplace(
+            &mut ezk,
+            (self.nx, self.ny, self.nz),
+            &mut self.planner,
+            false,
+        );
 
-    /// Interpolate E back to particles with the same B-spline weights; F = q E
-    /// Helper to reduce DRY between GPU and CPU variants.
-    /// Note: Parallelization here doesn't seem to have much effect.
-    fn forces_part_c(
-        &self,
-        pos: &[Vec3],
-        exk: &[Complex_],
-        eyk: &[Complex_],
-        ezk: &[Complex_],
-        q: &[f32],
-    ) -> Vec<Vec3> {
+        // Interpolate E back to particles with the same B-spline weights; F = q E
         let nx = self.nx;
         let ny = self.ny;
         let nz = self.nz;
@@ -228,7 +242,8 @@ impl PmeRecip {
         let ly = self.ly;
         let lz = self.lz;
 
-        pos.par_iter()
+        let f = posits
+            .par_iter()
             .enumerate()
             .map(|(i, &r)| {
                 let (ix0, wx) = bspline4_weights(r.x / lx * nx as f32);
@@ -261,72 +276,19 @@ impl PmeRecip {
                 }
 
                 let qi = q[i] as f64;
-                let e = Vec3 {
+                Vec3 {
                     x: (ex * qi) as f32,
                     y: (ey * qi) as f32,
                     z: (ez * qi) as f32,
-                };
-                e
-
-                // e * q[i] as f64
+                }
             })
-            .collect()
-    }
-
-    /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
-    pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
-        assert_eq!(posits.len(), q.len());
-
-        let n_pts = self.nx * self.ny * self.nz;
-        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
-        self.spread_charges(posits, q, &mut rho);
-
-        fft3_inplace(
-            &mut rho,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            true,
-        );
-
-        let (mut exk, mut eyk, mut ezk, energy) = self.forces_part_b(&rho, n_pts);
-        // let elapsed = start.elapsed();
-        // println!("SPME A: {} us", elapsed.as_micros());
-
-        // Note: These FFTs are the biggest time bottleneck.
-        // let start = Instant::now();
-        // Inverse FFT to real-space E grids
-        fft3_inplace(
-            &mut exk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut eyk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut ezk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        // let elapsed = start.elapsed();
-        // println!("SPME B: {} us", elapsed.as_micros());
-
-        // let start = Instant::now();
-        let f = self.forces_part_c(posits, &exk, &eyk, &ezk, q);
-
-        // let elapsed = start.elapsed();
-        // println!("SPME C: {} us", elapsed.as_micros());
+            .collect();
 
         // Interpolate φ to particles and compute ½ Σ q_i φ_i
         // let phi_vals = self.interpolate_scalar(posits, &phi_k);
         // let energy = 0.5 * q.iter().zip(phi_vals.iter()).map(|(qi, phi)| qi * phi).sum::<f64>();
 
-        (f, energy)
+        (f, energy as f32)
     }
 
     #[cfg(feature = "cuda")]
@@ -708,12 +670,14 @@ fn _taper(s: f64) -> (f64, f64) {
     (s_val, ds)
 }
 
-/// We use this for short-range Coulomb forces, as part of SPME.
+/// We use this for short-range Coulomb forces on the CPU, as part of SPME.
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
 /// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å.
 ///
 /// This assumes diff (and dir) is in order tgt - src.
 /// Also returns potential energy.
+///
+/// `dir` must be a unit vector.
 pub fn force_coulomb_short_range(
     dir: Vec3,
     dist: f32,
@@ -721,12 +685,10 @@ pub fn force_coulomb_short_range(
     inv_dist: f32,
     q_0: f32,
     q_1: f32,
-    // lr_switch: (f64, f64),
     cutoff_dist: f32,
     α: f32,
 ) -> (Vec3, f32) {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
-    // if r >= lr_switch.1 {
     if dist > cutoff_dist {
         return (Vec3::new_zero(), 0.);
     }
@@ -743,18 +705,6 @@ pub fn force_coulomb_short_range(
         * (erfc_term * inv_dist * inv_dist + 2.0 * α * exp_term * INV_SQRT_PI * inv_dist);
 
     (dir * force_mag, energy)
-
-    // Removed taper code.
-    // // Inside the taper region, return the short-range force.
-    // if r <= lr_switch.0 {
-    //     return f;
-    // }
-    //
-    // // Apply switch to the potential; to approximate on the force, multiply by S and add -U*dS/dr*r̂
-    // // For brevity, a common practical shortcut is scaling force by S(r):
-    // let s = (r - lr_switch.0) / (lr_switch.1 - lr_switch.0);
-    // let (S, _dSds) = taper(s);
-    // f * S
 }
 
 // // todo: Update this to reflect your changes to the algo above that apply tapering.

@@ -18,6 +18,9 @@ n-body approximations for long-range forces, this has utility when periodic boun
 If not using these, for example in cosmology simulations, consider Barnes Hut, or Fast Multipole Methods (FMM)
 instead.
 
+The API is split into two main parts: A standalone function to calculate short-range force, and 
+a struct with forces method for long-range reciprical forces.
+
 Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable 
 the `cuda` feature in `Cargo.toml`.
 
