@@ -55,7 +55,7 @@ fn force_coulomb_short_range(
 }
 
 #[pymodule]
-fn ewald(py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
+fn ewald(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PmeRecip>()?;
     m.add_function(wrap_pyfunction!(force_coulomb_short_range, m)?)?;
 

@@ -12,6 +12,13 @@ license = { file = "PYPI_LICENSE" }
 keywords = ["ewald", "spme", "molecular dynamics", "pme", "force field"]
 dynamic = ["version"]
 
+# Experimenting
+dependencies = [
+    "nvidia-cuda-runtime-cu12>=13.0",
+    "nvidia-cufft-cu12>=13.0",
+]
+
+
 classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Bio-Informatics",

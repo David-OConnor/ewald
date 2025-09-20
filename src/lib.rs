@@ -25,7 +25,7 @@ mod cuda_ffi;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaModule, CudaStream, DevicePtr, PushKernelArg, sys::CUstream};
+use cudarc::driver::{CudaModule, CudaStream, DevicePtr, sys::CUstream};
 // todo: This may be a good candidate for a standalone library.
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;

@@ -8,7 +8,10 @@
 
 [Original paper describing the SPME method](https://biomolmd.org/mw/images/e/e0/Spme.pdf)
 
-This library is for Python and Rust. Supports GPU, or thread-pooled CPU.
+This library is for Python and Rust. Supports GPU, and thread-pooled CPU.
+
+**Note: The Python version is currently CPU only**. We would like to fix this, but are having trouble
+linking Cuda.
 
 This has applications primarily in structural biology. For example, molecular dynamics. Compared to other
 n-body approximations for long-range forces, this has utility when periodic bounday conditions are used.
@@ -21,9 +24,13 @@ the `cuda` feature in `Cargo.toml`.
 Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
-Uses f32 for Lennard Jones and Coulomb interactions. Energy sums are computed as f64.
+Uses `f32` for Lennard Jones and Coulomb interactions. Energy sums are computed as `f64`.
 
 Here's an example of use. The Python API is equivalent.
+
+Note: For optimal performance, you may wish to implement short-range SPME integrated with Lennard Jones interactions
+in your application as an integrated GPU kernel, instead of using the short-range function here directly. This
+library shines when using its long-range reciprical implemention on GPU.
 
 ```rust
 use rayon::prelude::*;
@@ -75,3 +82,13 @@ impl System {
     }
 }
 ```
+
+
+### Note: Try this to reduce linux wheel size with cuda:
+maturin build --release --strip
+
+auditwheel repair \
+--exclude libcufft.so.12 \
+--exclude libnvrtc.so.12 \
+--exclude libcublas.so.12 \
+target/ (etc)
