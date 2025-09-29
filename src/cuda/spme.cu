@@ -2,6 +2,7 @@
 #include <cufft.h>
 #include <cufftXt.h>
 #include <cstdio>
+#include <cstdint>
 
 __device__ __forceinline__ int wrap_i(int a, int n) { a %= n; return (a < 0) ? a + n : a; }
 
