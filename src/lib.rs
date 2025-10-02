@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 mod cuda_ffi;
+// #[cfg(feature = "cuda")]
+// mod vk_fft_ffi;
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;

@@ -30,7 +30,7 @@ rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-13000"], optional=true }
 [target.'cfg(target_os = "windows")'.dependencies]
-cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13000"], optional=true }
+cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-13000"], optional=true }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.7", optional = true }
