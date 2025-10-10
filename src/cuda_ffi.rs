@@ -3,9 +3,12 @@
 
 // todo: Organize both this and teh .cu file. REmove unused, make order sensitible, and cyn order.
 
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
+use cudarc::driver::{CudaSlice, CudaStream, sys::CUstream};
 use rustfft::num_complex::Complex;
+
+use crate::{PmeRecip, cuda_ffi};
 
 unsafe extern "C" {
     pub(crate) fn spme_make_plan_r2c_c2r_many(
@@ -112,4 +115,74 @@ unsafe extern "C" {
         inv_n: f32,
         cu_stream: *mut c_void,
     );
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PmeRecip {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.planner_gpu.is_null() {
+                spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                self.planner_gpu = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PmeRecip {
+    fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
+        use std::ffi::c_void;
+        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
+
+        let cu_stream: CUstream = stream.cu_stream();
+        let raw_stream: *mut c_void = cu_stream as *mut c_void;
+
+        unsafe {
+            if self.planner_gpu.is_null() || self.plan_dims != dims {
+                if !self.planner_gpu.is_null() {
+                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                    self.planner_gpu = std::ptr::null_mut();
+                }
+                self.planner_gpu =
+                    cuda_ffi::spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
+                self.plan_dims = dims;
+                #[cfg(feature = "cuda")]
+                {
+                    self.gpu_tables = None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct GpuTables {
+    kx: CudaSlice<f32>,
+    ky: CudaSlice<f32>,
+    kz: CudaSlice<f32>,
+    bx: CudaSlice<f32>,
+    by: CudaSlice<f32>,
+    bz: CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl PmeRecip {
+    fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
+        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
+        if self.plan_dims != dims {
+            return;
+        }
+
+        if self.gpu_tables.is_none() {
+            self.gpu_tables = Some(GpuTables {
+                kx: stream.memcpy_stod(&self.kx).unwrap(),
+                ky: stream.memcpy_stod(&self.ky).unwrap(),
+                kz: stream.memcpy_stod(&self.kz).unwrap(),
+                bx: stream.memcpy_stod(&self.bmod2_x).unwrap(),
+                by: stream.memcpy_stod(&self.bmod2_y).unwrap(),
+                bz: stream.memcpy_stod(&self.bmod2_z).unwrap(),
+            });
+        }
+    }
 }
