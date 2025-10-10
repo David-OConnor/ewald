@@ -140,6 +140,7 @@ impl PmeRecip {
     }
 
     /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
+    /// todo: Is there a way to exclude static targets, or must all sources be targets?
     pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
 
