@@ -18,18 +18,22 @@ use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-mod cuda_ffi;
+mod cufft;
 #[cfg(feature = "cuda")]
 mod vk_fft;
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaModule, CudaStream, DevicePtr, sys::CUstream};
+use cudarc::driver::{CudaModule, CudaStream, DevicePtr};
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
+
+use crate::vk_fft::GpuTablesVk;
+
+#[cfg(feature = "cuda")]
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -74,6 +78,8 @@ pub struct PmeRecip {
     plan_dims: (i32, i32, i32),
     #[cfg(feature = "cuda")]
     gpu_tables: Option<GpuTables>,
+    #[cfg(feature = "cuda")]
+    gpu_tables_vk: Option<GpuTablesVk>,
 }
 
 impl PmeRecip {
@@ -114,7 +120,8 @@ impl PmeRecip {
             plan_dims: (0, 0, 0),
             #[cfg(feature = "cuda")]
             gpu_tables: None,
-            // ..Default::default()
+            #[cfg(feature = "cuda")]
+            gpu_tables_vk: None,
         }
     }
 
@@ -365,7 +372,7 @@ impl PmeRecip {
 
         // Scatter on GPU
         unsafe {
-            cuda_ffi::spme_scatter_rho_4x4x4_launch(
+            cufft::spme_scatter_rho_4x4x4_launch(
                 pos_ptr as *const _,
                 q_ptr as *const _,
                 rho_real_ptr as *mut _,
@@ -388,25 +395,24 @@ impl PmeRecip {
         if self.planner_gpu.is_null() || self.plan_dims != (nx as i32, ny as i32, nz as i32) {
             unsafe {
                 if !self.planner_gpu.is_null() {
-                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                    cufft::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
                 }
-                self.planner_gpu = cuda_ffi::spme_make_plan_r2c_c2r_many(
-                    nx as i32, ny as i32, nz as i32, cu_stream,
-                );
+                self.planner_gpu =
+                    cufft::spme_make_plan_r2c_c2r_many(nx as i32, ny as i32, nz as i32, cu_stream);
                 self.plan_dims = (nx as i32, ny as i32, nz as i32);
             }
         }
 
         // Forward FFT on GPU: real -> half complex
         unsafe {
-            cuda_ffi::spme_exec_forward_r2c(
+            cufft::spme_exec_forward_r2c(
                 self.planner_gpu,
                 rho_real_ptr as *mut _,
                 rho_k_ptr as *mut _,
             );
 
             // Apply G(k) and gradient to get Exk/Eyk/Ezk
-            cuda_ffi::spme_apply_ghat_and_grad_launch(
+            cufft::spme_apply_ghat_and_grad_launch(
                 rho_k_ptr as *const _,
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
@@ -426,7 +432,7 @@ impl PmeRecip {
             );
 
             // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
-            cuda_ffi::spme_exec_inverse_ExEyEz_c2r(
+            cufft::spme_exec_inverse_ExEyEz_c2r(
                 self.planner_gpu,
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
@@ -437,7 +443,7 @@ impl PmeRecip {
             );
 
             // Scale by 1/N once here
-            cuda_ffi::spme_scale_ExEyEz_after_c2r(
+            cufft::spme_scale_ExEyEz_after_c2r(
                 ex_ptr, ey_ptr, ez_ptr, nx as i32, ny as i32, nz as i32, cu_stream,
             );
         }
@@ -447,7 +453,7 @@ impl PmeRecip {
         let (f_ptr, _) = f_d.device_ptr(stream);
         let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
         unsafe {
-            cuda_ffi::spme_gather_forces_to_atoms_launch(
+            cufft::spme_gather_forces_to_atoms_launch(
                 pos_ptr as *const _,
                 ex_ptr as *const _,
                 ey_ptr as *const _,
@@ -475,7 +481,7 @@ impl PmeRecip {
         let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();
         let (partial_ptr, _) = partial_d.device_ptr(stream);
         unsafe {
-            cuda_ffi::spme_energy_half_spectrum_launch(
+            cufft::spme_energy_half_spectrum_launch(
                 rho_k_ptr as *const _,
                 kx_ptr as *const _,
                 ky_ptr as *const _,
@@ -574,7 +580,6 @@ fn bspline4_weights(s: f32) -> (isize, [f32; SPLINE_ORDER]) {
     (i0, [w0, w1, w2, w3])
 }
 
-#[inline]
 fn wrap(i: isize, n: usize) -> usize {
     let n_isize = n as isize;
     let mut v = i % n_isize;
@@ -762,4 +767,13 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
+}
+
+pub(crate) struct GpuTables {
+    pub kx: CudaSlice<f32>,
+    pub ky: CudaSlice<f32>,
+    pub kz: CudaSlice<f32>,
+    pub bx: CudaSlice<f32>,
+    pub by: CudaSlice<f32>,
+    pub bz: CudaSlice<f32>,
 }

@@ -1,14 +1,13 @@
-//! We use *host-side* CUDA functions for long-range reciprical FFTs. This module contains FFI
-//! bindings between the rust code, and CUDA FFI functions.
+//! We use *host-side* cuFFT functions for long-range reciprical FFTs. This module contains FFI
+//! bindings between the rust code, and cuFFT FFI functions.
 
 // todo: Organize both this and teh .cu file. REmove unused, make order sensitible, and cyn order.
 
 use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaSlice, CudaStream, sys::CUstream};
-use rustfft::num_complex::Complex;
 
-use crate::{PmeRecip, cuda_ffi};
+use crate::{GpuTables, PmeRecip, cufft};
 
 unsafe extern "C" {
     pub(crate) fn spme_make_plan_r2c_c2r_many(
@@ -117,7 +116,6 @@ unsafe extern "C" {
     );
 }
 
-#[cfg(feature = "cuda")]
 impl Drop for PmeRecip {
     fn drop(&mut self) {
         unsafe {
@@ -129,9 +127,8 @@ impl Drop for PmeRecip {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl PmeRecip {
-    fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
+    pub fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
         use std::ffi::c_void;
         let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
 
@@ -141,11 +138,10 @@ impl PmeRecip {
         unsafe {
             if self.planner_gpu.is_null() || self.plan_dims != dims {
                 if !self.planner_gpu.is_null() {
-                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                    spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
                     self.planner_gpu = std::ptr::null_mut();
                 }
-                self.planner_gpu =
-                    cuda_ffi::spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
+                self.planner_gpu = spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
                 self.plan_dims = dims;
                 #[cfg(feature = "cuda")]
                 {
@@ -156,19 +152,8 @@ impl PmeRecip {
     }
 }
 
-#[cfg(feature = "cuda")]
-struct GpuTables {
-    kx: CudaSlice<f32>,
-    ky: CudaSlice<f32>,
-    kz: CudaSlice<f32>,
-    bx: CudaSlice<f32>,
-    by: CudaSlice<f32>,
-    bz: CudaSlice<f32>,
-}
-
-#[cfg(feature = "cuda")]
 impl PmeRecip {
-    fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
+    pub fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
         let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
         if self.plan_dims != dims {
             return;
