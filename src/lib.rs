@@ -6,10 +6,10 @@
 // #![feature(core_float_math)] When stable
 
 //! For Smooth-Particle-Mesh Ewald; a standard approximation for Coulomb forces in MD.
-//! We use this to handle periodic boundary conditions properly, which we use to take the
-//! water molecules into account. See the Readme for details. The API is split into
+//! We use this to handle periodic boundary conditions (e.g. of the solvent) properly.
+//! See the Readme for details. The API is split into
 //! two main parts: A standalone function to calculate short-range force, and
-//! a struct with forces method for long-range reciprical forces.
+//! a struct with forces methods for long-range reciprical forces.
 
 extern crate core;
 
@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 mod cuda_ffi;
-// #[cfg(feature = "cuda")]
-// mod vk_fft_ffi;
+#[cfg(feature = "cuda")]
+mod vk_fft;
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
@@ -35,6 +35,9 @@ const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
 const TWO_INV_SQRT_PI: f32 = 2. / SQRT_PI;
 
+// The cardinal B-spline of order used to spread point charges to the mesh and
+// to interpolate forces back. 4 is the safe default, and should probably not be changed.
+// 3 is faster, but less accurate. 5+ are slow.
 const SPLINE_ORDER: usize = 4;
 
 type Complex_ = Complex<f32>;
@@ -44,6 +47,7 @@ pub struct PmeRecip {
     nx: usize,
     ny: usize,
     nz: usize,
+    /// lx, ly and lz are box-lengths in real space.
     lx: f32,
     ly: f32,
     lz: f32,
@@ -59,11 +63,12 @@ pub struct PmeRecip {
     bmod2_x: Vec<f32>,
     bmod2_y: Vec<f32>,
     bmod2_z: Vec<f32>,
-    // todo: Remove this if on Cuda, eventually
-    // #[cfg(not(featuer = "cuda"))
+    /// For CPU FFTs
     planner: FftPlanner<f32>,
     #[cfg(feature = "cuda")]
     planner_gpu: *mut std::ffi::c_void,
+    #[cfg(feature = "cuda")]
+    planner_gpu_vk: *mut std::ffi::c_void,
     // todo: Do you want this? Or is it the same as nx, ny, nz?
     #[cfg(feature = "cuda")]
     plan_dims: (i32, i32, i32),
@@ -104,6 +109,8 @@ impl PmeRecip {
             #[cfg(feature = "cuda")]
             planner_gpu: std::ptr::null_mut(),
             #[cfg(feature = "cuda")]
+            planner_gpu_vk: std::ptr::null_mut(),
+            #[cfg(feature = "cuda")]
             plan_dims: (0, 0, 0),
             #[cfg(feature = "cuda")]
             gpu_tables: None,
@@ -111,7 +118,6 @@ impl PmeRecip {
         }
     }
 
-    // keep this in a non-cfg impl block
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
         let nxny = self.nx * self.ny;
         for (r, &qi) in pos.iter().zip(q.iter()) {
@@ -123,13 +129,15 @@ impl PmeRecip {
             let (iy0, wy) = bspline4_weights(sy);
             let (iz0, wz) = bspline4_weights(sz);
 
-            for a in 0..4 {
+            for a in 0..SPLINE_ORDER {
                 let ix = wrap(ix0 + a as isize, self.nx);
                 let wxa = wx[a];
-                for b in 0..4 {
+
+                for b in 0..SPLINE_ORDER {
                     let iy = wrap(iy0 + b as isize, self.ny);
                     let wxy = wxa * wy[b];
-                    for c in 0..4 {
+
+                    for c in 0..SPLINE_ORDER {
                         let iz = wrap(iz0 + c as isize, self.nz);
                         let idx = iz * nxny + iy * self.nx + ix;
                         rho[idx].re += qi * wxy * wz[c];
@@ -160,13 +168,13 @@ impl PmeRecip {
         let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
         let (vol, alpha) = (self.vol, self.alpha);
 
+        // eAk are per-dimension phase factors.
         // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
         let mut exk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
         let mut eyk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
         let mut ezk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
 
-        // let start = Instant::now();
-        let energy: f64 = exk
+        let mut energy: f64 = exk
             .par_iter_mut()
             .zip(eyk.par_iter_mut())
             .zip(ezk.par_iter_mut())
@@ -180,7 +188,6 @@ impl PmeRecip {
                 let kyv = ky[iy];
                 let kzv = kz[iz];
 
-                // let k2 = kxv * kxv + kyv * kyv + kzv * kzv;
                 let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
                 if k2 == 0.0 {
                     *ex = Complex::new(0.0, 0.0);
@@ -202,6 +209,7 @@ impl PmeRecip {
                 let phi_k = rho[idx] * ghat;
 
                 // E(k) = i k φ(k)
+                // todo: QC if you need to flip the sign here on kxv, kyv. (Rem the -)
                 *ex = Complex::new(0.0, -kxv) * phi_k;
                 *ey = Complex::new(0.0, -kyv) * phi_k;
                 *ez = Complex::new(0.0, -kzv) * phi_k;
@@ -213,6 +221,10 @@ impl PmeRecip {
                 0.5 * re64
             })
             .sum();
+
+        let self_energy: f64 = -(self.alpha / SQRT_PI) as f64
+            * q.iter().map(|&qi| (qi as f64) * (qi as f64)).sum::<f64>();
+        energy += self_energy;
 
         // Note: These FFTs are the biggest time bottleneck.
         // let start = Instant::now();
@@ -543,7 +555,7 @@ fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
 
 /// Cubic B-spline weights for 4 neighbors; returns starting index and 4 weights.
 /// Input s is in grid units (0..n), arbitrary real; we wrap indices to the grid.
-fn bspline4_weights(s: f32) -> (isize, [f32; 4]) {
+fn bspline4_weights(s: f32) -> (isize, [f32; SPLINE_ORDER]) {
     let sfloor = s.floor();
     let u = s - sfloor; // fractional part in [0,1)
     let i0 = sfloor as isize - 1; // left-most point of 4-support
@@ -749,73 +761,4 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
-}
-
-#[cfg(feature = "cuda")]
-impl PmeRecip {
-    fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
-        use std::ffi::c_void;
-        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
-
-        let cu_stream: CUstream = stream.cu_stream();
-        let raw_stream: *mut c_void = cu_stream as *mut c_void;
-
-        unsafe {
-            if self.planner_gpu.is_null() || self.plan_dims != dims {
-                if !self.planner_gpu.is_null() {
-                    cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                    self.planner_gpu = std::ptr::null_mut();
-                }
-                self.planner_gpu =
-                    cuda_ffi::spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
-                self.plan_dims = dims;
-                #[cfg(feature = "cuda")]
-                {
-                    self.gpu_tables = None;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for PmeRecip {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.planner_gpu.is_null() {
-                cuda_ffi::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                self.planner_gpu = std::ptr::null_mut();
-            }
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-struct GpuTables {
-    kx: CudaSlice<f32>,
-    ky: CudaSlice<f32>,
-    kz: CudaSlice<f32>,
-    bx: CudaSlice<f32>,
-    by: CudaSlice<f32>,
-    bz: CudaSlice<f32>,
-}
-
-#[cfg(feature = "cuda")]
-impl PmeRecip {
-    fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
-        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
-        if self.plan_dims != dims {
-            return;
-        } // ensure plan first
-        if self.gpu_tables.is_none() {
-            self.gpu_tables = Some(GpuTables {
-                kx: stream.memcpy_stod(&self.kx).unwrap(),
-                ky: stream.memcpy_stod(&self.ky).unwrap(),
-                kz: stream.memcpy_stod(&self.kz).unwrap(),
-                bx: stream.memcpy_stod(&self.bmod2_x).unwrap(),
-                by: stream.memcpy_stod(&self.bmod2_y).unwrap(),
-                bz: stream.memcpy_stod(&self.bmod2_z).unwrap(),
-            });
-        }
-    }
 }
