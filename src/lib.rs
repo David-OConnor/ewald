@@ -17,10 +17,10 @@ use std::f32::consts::{PI, TAU};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cfft")]
 mod cufft;
 #[cfg(feature = "cuda")]
-mod vk_fft;
+pub mod vk_fft;
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
@@ -31,9 +31,8 @@ use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
-use crate::vk_fft::GpuTablesVk;
-
 #[cfg(feature = "cuda")]
+use crate::vk_fft::GpuTablesVk;
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -313,8 +312,8 @@ impl PmeRecip {
         (f, energy as f32)
     }
 
-    #[cfg(feature = "cuda")]
-    pub fn forces_gpu(
+    #[cfg(feature = "cufft")]
+    pub fn forces_gpu_cufft(
         &mut self,
         stream: &Arc<CudaStream>,
         _module: &Arc<CudaModule>,
@@ -769,6 +768,7 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
     dir * fmag
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct GpuTables {
     pub kx: CudaSlice<f32>,
     pub ky: CudaSlice<f32>,

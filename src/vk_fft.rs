@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, mem::size_of, sync::Arc};
 
 use lin_alg::f32::Vec3;
 
@@ -7,6 +7,17 @@ use crate::{PmeRecip, SQRT_PI, bspline4_weights, wrap};
 #[repr(C)]
 pub struct VkContext {
     pub handle: *mut c_void, // opaque (created in C)
+}
+
+// We don't necessarily expect to use this, but required in some applications.
+impl Default for VkContext {
+    fn default() -> Self {
+        unsafe {
+            let handle = vk_make_context_default();
+            assert!(!handle.is_null(), "vk_make_context_default() returned null");
+            VkContext { handle }
+        }
+    }
 }
 
 #[link(name = "vk_fft")] // built from vk_fft.c via build.rs
@@ -178,7 +189,7 @@ impl PmeRecip {
 }
 
 impl PmeRecip {
-    pub fn forces_vkfft(
+    pub fn forces_gpu(
         &mut self,
         ctx: &Arc<VkContext>,
         pos: &[Vec3],

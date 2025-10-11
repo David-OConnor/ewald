@@ -40,7 +40,7 @@ void* vkfft_make_plan_r2c_c2r_many(void* ctx_, int nx, int ny, int nz) {
 
   // R2C
   memset(&p->cfg_r2c, 0, sizeof(p->cfg_r2c));
-  p->cfg_r2c.api = VKFFT_BACKEND_CUDA;     // <—— important
+  p->cfg_r2c.api = VKFFT_BACKEND_CUDA;
   p->cfg_r2c.FFTdim = 3;
   p->cfg_r2c.size[0] = (uint64_t)nx;
   p->cfg_r2c.size[1] = (uint64_t)ny;
