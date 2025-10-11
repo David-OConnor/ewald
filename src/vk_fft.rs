@@ -1,5 +1,6 @@
 use std::{ffi::c_void, mem::size_of, sync::Arc};
 
+use cudarc::driver::{CudaStream, sys::CUstream};
 use lin_alg::f32::Vec3;
 
 use crate::{PmeRecip, SQRT_PI, bspline4_weights, wrap};
@@ -17,6 +18,16 @@ impl Default for VkContext {
             assert!(!handle.is_null(), "vk_make_context_default() returned null");
             VkContext { handle }
         }
+    }
+}
+
+impl VkContext {
+    /// Adopt an existing cudarc stream (we will NOT destroy it).
+    pub fn from_cudarc_stream(stream: &std::sync::Arc<CudaStream>) -> Self {
+        let cu: CUstream = stream.cu_stream();
+        let handle = unsafe { vk_make_context_from_stream(cu as *mut c_void) };
+        assert!(!handle.is_null(), "vk_make_context_from_stream returned null");
+        VkContext { handle }
     }
 }
 
@@ -92,6 +103,7 @@ unsafe extern "C" {
 
     // (optional) context lifecycle if you want to create it here
     pub fn vk_make_context_default() -> *mut c_void;
+    fn vk_make_context_from_stream(cu_stream: *mut c_void) -> *mut c_void;
     pub fn vk_destroy_context(ctx: *mut c_void);
 }
 

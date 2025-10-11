@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 void* vk_make_context_default(void);
+void* vk_make_context_from_stream(void* cu_stream); // returns VkContext*
 void  vk_destroy_context(void* ctx);
 
 void* vkfft_make_plan_r2c_c2r_many(void* ctx, int32_t nx, int32_t ny, int32_t nz);
