@@ -10,7 +10,13 @@ use std::{ffi::c_void, ptr::null_mut, sync::Arc};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use lin_alg::f32::Vec3;
 
-use crate::{GpuTables, PmeRecip, dev_ptr, dev_ptr_mut};
+use crate::{
+    PmeRecip,
+    gpu_shared::{
+        GpuTables, dev_ptr, dev_ptr_mut, gather_forces_to_atoms_launch, scale_ExEyEz_after_c2r,
+    },
+};
+use crate::gpu_shared::scatter_rho_4x4x4_launch;
 
 unsafe extern "C" {
     pub(crate) fn spme_make_plan_r2c_c2r_many(
@@ -30,18 +36,7 @@ unsafe extern "C" {
         ez: *mut c_void,
     );
 
-    // todo: Used by both.
-    pub(crate) fn spme_scale_ExEyEz_after_c2r(
-        ex: *mut c_void,
-        ey: *mut c_void,
-        ez: *mut c_void,
-        nx: i32,
-        ny: i32,
-        nz: i32,
-        cu_stream: *mut c_void,
-    );
-
-    pub(crate) fn spme_apply_ghat_and_grad_launch(
+    pub(crate) fn apply_ghat_and_grad_launch(
         rho: *const c_void,
         exk: *mut c_void,
         eyk: *mut c_void,
@@ -62,7 +57,7 @@ unsafe extern "C" {
 
     pub(crate) fn spme_destroy_plan_r2c_c2r_many(plan: *mut c_void);
 
-    pub(crate) fn spme_energy_half_spectrum_launch(
+    pub(crate) fn energy_half_spectrum_launch(
         rho_k: *const c_void,
         kx: *const c_void,
         ky: *const c_void,
@@ -81,43 +76,10 @@ unsafe extern "C" {
         cu_stream: *mut c_void,
     );
 
-    pub(crate) fn spme_scatter_rho_4x4x4_launch(
-        pos: *const c_void,
-        q: *const c_void,
-        rho: *mut c_void,
-        n_atoms: i32,
-        nx: i32,
-        ny: i32,
-        nz: i32,
-        lx: f32,
-        ly: f32,
-        lz: f32,
-        cu_stream: *mut c_void,
-    );
-
     pub(crate) fn spme_exec_forward_r2c(
         plan: *mut c_void,
         rho_real: *mut c_void,
         rho_k: *mut c_void,
-    );
-
-    // todo: Used by both.
-    pub(crate) fn spme_gather_forces_to_atoms_launch(
-        pos: *const c_void,
-        ex: *const c_void,
-        ey: *const c_void,
-        ez: *const c_void,
-        q: *const c_void,
-        out_f: *mut c_void,
-        n_atoms: i32,
-        nx: i32,
-        ny: i32,
-        nz: i32,
-        lx: f32,
-        ly: f32,
-        lz: f32,
-        inv_n: f32,
-        cu_stream: *mut c_void,
     );
 }
 
@@ -128,6 +90,8 @@ impl PmeRecip {
         pos: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
+        assert_eq!(pos.len(), q.len());
+
         if self.gpu_tables.is_none() {
             // First run
             let k = (&self.kx, &self.ky, &self.kz);
@@ -137,7 +101,9 @@ impl PmeRecip {
             self.gpu_tables = Some(GpuTables::new(k, bmod2, stream));
         }
 
-        assert_eq!(pos.len(), q.len());
+        let cu_stream = stream.cu_stream() as *mut c_void;
+        let tables = self.gpu_tables.as_ref().unwrap();
+        let f32_size = size_of::<f32>();
 
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
@@ -150,7 +116,7 @@ impl PmeRecip {
         let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
         let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
         let base_r = base_r_ptr as usize;
-        let stride_r_bytes = n_real * size_of::<f32>();
+        let stride_r_bytes = n_real * f32_size;
 
         let ex_ptr = base_r as *mut c_void;
         let ey_ptr = (base_r + stride_r_bytes) as *mut c_void;
@@ -160,22 +126,19 @@ impl PmeRecip {
         let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
         let (base_ptr, _) = exeyezk_d.device_ptr(stream);
         let base = base_ptr as usize;
-        let stride_bytes = complex_len * size_of::<f32>();
+        let stride_bytes = complex_len * f32_size;
 
         let exk_ptr = base as *mut c_void;
         let eyk_ptr = (base + stride_bytes) as *mut c_void;
         let ezk_ptr = (base + 2 * stride_bytes) as *mut c_void;
 
-        let cu_stream = stream.cu_stream() as *mut c_void;
+        let kx_ptr = dev_ptr(&tables.kx, stream);
+        let ky_ptr = dev_ptr(&tables.ky, stream);
+        let kz_ptr = dev_ptr(&tables.kz, stream);
 
-        let tables = self.gpu_tables.as_ref().unwrap();
-
-        let (kx_ptr, _) = tables.kx.device_ptr(stream);
-        let (ky_ptr, _) = tables.ky.device_ptr(stream);
-        let (kz_ptr, _) = tables.kz.device_ptr(stream);
-        let (bx_ptr, _) = tables.bx.device_ptr(stream);
-        let (by_ptr, _) = tables.by.device_ptr(stream);
-        let (bz_ptr, _) = tables.bz.device_ptr(stream);
+        let bx_ptr = dev_ptr(&tables.bx, stream);
+        let by_ptr = dev_ptr(&tables.by, stream);
+        let bz_ptr = dev_ptr(&tables.bz, stream);
 
         // H2D: positions & charges (flattened)
         let pos_flat: Vec<f32> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
@@ -184,10 +147,12 @@ impl PmeRecip {
 
         // rho_real on device
         let rho_real_d: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        // rho(k) (half-spectrum) on device
+        let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
 
         // Scatter on GPU
         unsafe {
-            spme_scatter_rho_4x4x4_launch(
+            scatter_rho_4x4x4_launch(
                 dev_ptr(&pos_d, stream),
                 dev_ptr(&q_d, stream),
                 dev_ptr_mut(&rho_real_d, stream),
@@ -202,30 +167,26 @@ impl PmeRecip {
             );
         }
 
-        // rho(k) (half-spectrum) on device
-        let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let (rho_k_ptr, _) = rho_k_d.device_ptr(stream);
-
         // Forward FFT on GPU: real -> half complex
         unsafe {
             spme_exec_forward_r2c(
                 self.planner_gpu,
-                rho_real_ptr as *mut _,
-                rho_k_ptr as *mut _,
+                dev_ptr_mut(&rho_real_d, stream),
+                dev_ptr_mut(&rho_k_d, stream),
             );
 
             // Apply G(k) and gradient to get Exk/Eyk/Ezk
-            spme_apply_ghat_and_grad_launch(
-                rho_k_ptr as *const _,
+            apply_ghat_and_grad_launch(
+                dev_ptr_mut(&rho_k_d, stream),
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
                 ezk_ptr as *mut _,
-                kx_ptr as *const _,
-                ky_ptr as *const _,
-                kz_ptr as *const _,
-                bx_ptr as *const _,
-                by_ptr as *const _,
-                bz_ptr as *const _,
+                kx_ptr,
+                ky_ptr,
+                kz_ptr,
+                bx_ptr,
+                by_ptr,
+                bz_ptr,
                 nx as i32,
                 ny as i32,
                 nz as i32,
@@ -246,23 +207,23 @@ impl PmeRecip {
             );
 
             // Scale by 1/N once here
-            spme_scale_ExEyEz_after_c2r(
+            scale_ExEyEz_after_c2r(
                 ex_ptr, ey_ptr, ez_ptr, nx as i32, ny as i32, nz as i32, cu_stream,
             );
         }
 
         // Gather forces F = q * E
         let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
-        let (f_ptr, _) = f_d.device_ptr(stream);
         let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
+
         unsafe {
-            spme_gather_forces_to_atoms_launch(
-                pos_ptr as *const _,
+            gather_forces_to_atoms_launch(
+                dev_ptr(&pos_d, stream),
                 ex_ptr as *const _,
                 ey_ptr as *const _,
                 ez_ptr as *const _,
-                q_ptr as *const _,
-                f_ptr as *mut _,
+                dev_ptr(&q_d, stream),
+                dev_ptr_mut(&f_d, stream),
                 pos.len() as i32,
                 nx as i32,
                 ny as i32,
@@ -284,8 +245,8 @@ impl PmeRecip {
         let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();
         let (partial_ptr, _) = partial_d.device_ptr(stream);
         unsafe {
-            spme_energy_half_spectrum_launch(
-                rho_k_ptr as *const _,
+            energy_half_spectrum_launch(
+                dev_ptr_mut(&rho_k_d, stream),
                 kx_ptr as *const _,
                 ky_ptr as *const _,
                 kz_ptr as *const _,
@@ -321,17 +282,6 @@ impl PmeRecip {
         }
 
         (f, energy)
-    }
-}
-
-impl Drop for PmeRecip {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.planner_gpu.is_null() {
-                spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                self.planner_gpu = null_mut();
-            }
-        }
     }
 }
 

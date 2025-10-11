@@ -11,7 +11,6 @@
 
 #include "spme_shared.cu"
 
-__device__ __forceinline__ int wrap_i(int a, int n) { a %= n; return (a < 0) ? a + n : a; }
 
 // A minimal CUFFT error checker.
 #ifndef CUFFT_CHECK
@@ -32,13 +31,6 @@ struct PlanWrap {
     int nx, ny, nz;
     cudaStream_t stream;
 };
-
-__global__ void scale3(float* ex, float* ey, float* ez, size_t n, float s) {
-    size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-    if (i < n) {
-        ex[i] *= s; ey[i] *= s; ez[i] *= s;
-    }
-}
 
 extern "C"
 void* spme_make_plan_r2c_c2r_many(int nx, int ny, int nz, void* cu_stream) {
@@ -69,7 +61,7 @@ void* spme_make_plan_r2c_c2r_many(int nx, int ny, int nz, void* cu_stream) {
 }
 
 extern "C" __global__
-void spme_apply_ghat_and_grad(
+void apply_ghat_and_grad(
     const cufftComplex* __restrict__ rho,
     cufftComplex* __restrict__ exk,
     cufftComplex* __restrict__ eyk,
@@ -132,7 +124,7 @@ void spme_destroy_plan_r2c_c2r_many(void* plan) {
 }
 
 extern "C"
-void spme_apply_ghat_and_grad_launch(
+void apply_ghat_and_grad_launch(
     const void* rho,
     void* exk, void* eyk, void* ezk,
     const void* kx, const void* ky, const void* kz,
@@ -145,7 +137,8 @@ void spme_apply_ghat_and_grad_launch(
 
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
-    spme_apply_ghat_and_grad<<<blocks, threads, 0, s>>>(
+
+    apply_ghat_and_grad<<<blocks, threads, 0, s>>>(
         static_cast<const cufftComplex*>(rho),
         static_cast<cufftComplex*>(exk),
         static_cast<cufftComplex*>(eyk),
@@ -161,7 +154,7 @@ void spme_apply_ghat_and_grad_launch(
 }
 
 extern "C"
-void spme_scatter_rho_4x4x4_launch(
+void scatter_rho_4x4x4_launch(
     const void* pos, const void* q, void* rho,
     int n_atoms, int nx, int ny, int nz,
     float lx, float ly, float lz, void* cu_stream)
@@ -169,7 +162,7 @@ void spme_scatter_rho_4x4x4_launch(
     auto s = reinterpret_cast<cudaStream_t>(cu_stream);
     int threads = 256;
     int blocks  = (n_atoms + threads - 1) / threads;
-    spme_scatter_rho_4x4x4<<<blocks, threads, 0, s>>>(
+    scatter_rho_4x4x4<<<blocks, threads, 0, s>>>(
         static_cast<const float3*>(pos),
         static_cast<const float*>(q),
         static_cast<float*>(rho),
@@ -193,7 +186,7 @@ void spme_exec_inverse_ExEyEz_c2r(void* plan,
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r_many, exk, ex));
 }
 
-__global__ void spme_energy_half_spectrum(
+__global__ void energy_half_spectrum(
     const cufftComplex* __restrict__ rho_k,
     const float* __restrict__ kx, const float* __restrict__ ky, const float* __restrict__ kz,
     const float* __restrict__ bx, const float* __restrict__ by, const float* __restrict__ bz,
@@ -249,7 +242,7 @@ void spme_exec_forward_r2c(void* plan, float* rho_real, cufftComplex* rho_k) {
 }
 
 extern "C"
-void spme_energy_half_spectrum_launch(
+void energy_half_spectrum_launch(
     const void* rho_k,
     const void* kx, const void* ky, const void* kz,
     const void* bx, const void* by, const void* bz,
@@ -259,65 +252,10 @@ void spme_energy_half_spectrum_launch(
 {
     auto s = reinterpret_cast<cudaStream_t>(cu_stream);
     size_t shmem = size_t(threads) * sizeof(double);
-    spme_energy_half_spectrum<<<blocks, threads, shmem, s>>>(
+    energy_half_spectrum<<<blocks, threads, shmem, s>>>(
         static_cast<const cufftComplex*>(rho_k),
         static_cast<const float*>(kx), static_cast<const float*>(ky), static_cast<const float*>(kz),
         static_cast<const float*>(bx), static_cast<const float*>(by), static_cast<const float*>(bz),
         nx, ny, nz, vol, alpha,
         static_cast<double*>(partial_sums));
-}
-
-extern "C" __global__
-void spme_gather_forces_to_atoms(
-    const float3* __restrict__ pos,
-    const float*  __restrict__ ex,
-    const float*  __restrict__ ey,
-    const float*  __restrict__ ez,
-    const float*  __restrict__ q,
-    float3*       __restrict__ out_f,
-    int n_atoms, int nx, int ny, int nz,
-    float lx, float ly, float lz
-    )
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_atoms) return;
-
-    float3 r = pos[i];
-    float sx = r.x / lx * nx;
-    float sy = r.y / ly * ny;
-    float sz = r.z / lz * nz;
-
-    int ix0 = __float2int_rd(sx) - 1;
-    int iy0 = __float2int_rd(sy) - 1;
-    int iz0 = __float2int_rd(sz) - 1;
-
-    float u = sx - floorf(sx);
-    float v = sy - floorf(sy);
-    float w = sz - floorf(sz);
-
-    float u2=u*u, u3=u2*u, um=1.f-u; float wx[4] = {(um*um*um)/6.f,(3.f*u3-6.f*u2+4.f)/6.f,(-3.f*u3+3.f*u2+3.f*u+1.f)/6.f,u3/6.f};
-    float v2=v*v, v3=v2*v, vm=1.f-v; float wy[4] = {(vm*vm*vm)/6.f,(3.f*v3-6.f*v2+4.f)/6.f,(-3.f*v3+3.f*v2+3.f*v+1.f)/6.f,v3/6.f};
-    float w2=w*w, w3=w2*w, wm=1.f-w; float wz[4] = {(wm*wm*wm)/6.f,(3.f*w3-6.f*w2+4.f)/6.f,(-3.f*w3+3.f*w2+3.f*w+1.f)/6.f,w3/6.f};
-
-    float Exi=0.f, Eyi=0.f, Ezi=0.f;
-    for (int a=0;a<4;++a){
-        int ix = wrap_i(ix0 + a, nx);
-        float wxa = wx[a];
-        for (int b=0;b<4;++b){
-            int iy = wrap_i(iy0 + b, ny);
-            float wxy = wxa * wy[b];
-            size_t base = size_t(iy)*nx + ix;
-            for (int c=0;c<4;++c){
-                int iz = wrap_i(iz0 + c, nz);
-                float wfac = wxy * wz[c];
-                size_t idx = size_t(iz)*nx*ny + base;
-                Exi += wfac * ex[idx];
-                Eyi += wfac * ey[idx];
-                Ezi += wfac * ez[idx];
-            }
-        }
-    }
-
-    float s = q[i];
-    out_f[i] = make_float3(Exi*s, Eyi*s, Ezi*s);
 }

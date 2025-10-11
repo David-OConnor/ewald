@@ -40,4 +40,4 @@ cc = "1.2.41"
 [features]
 cuda = []  # No associated deps; just to feature gate code that applies to either FFI lib.
 cufft = ["cuda_setup", "cudarc", "lin_alg/cuda", "cuda"]
-vkfft = ["cudarc", "cuda"]
+vkfft = ["cuda_setup", "cudarc", "cuda"]

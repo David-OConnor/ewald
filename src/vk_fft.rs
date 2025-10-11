@@ -1,16 +1,15 @@
-use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::Arc};
+use std::{ffi::c_void, mem::size_of, sync::Arc};
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, sys::CUstream};
 use lin_alg::f32::Vec3;
 
 use crate::{
-    GpuTables, PmeRecip, SQRT_PI, bspline4_weights,
-    cufft::{
-        spme_gather_forces_to_atoms_launch, spme_scale_ExEyEz_after_c2r,
-        spme_scatter_rho_4x4x4_launch,
+    PmeRecip, SQRT_PI,
+    gpu_shared::{
+        GpuTables, dev_ptr, dev_ptr_mut, gather_forces_to_atoms_launch, scale_ExEyEz_after_c2r,
     },
-    dev_ptr, dev_ptr_mut, wrap,
 };
+use crate::gpu_shared::{scatter_rho_4x4x4_launch};
 
 #[repr(C)]
 pub struct VkContext {
@@ -46,7 +45,7 @@ impl VkContext {
 unsafe extern "C" {
     // plan lifecycle
     pub fn vkfft_make_plan_r2c_c2r_many(ctx: *mut c_void, nx: i32, ny: i32, nz: i32)
-    -> *mut c_void;
+                                        -> *mut c_void;
     pub fn vkfft_destroy_plan(plan: *mut c_void);
 
     // device memory helpers
@@ -69,18 +68,18 @@ unsafe extern "C" {
     );
 
     // SPME kernels on k-grid (compute shaders)
-    pub fn vk_spme_apply_ghat_and_grad(
+    pub fn vk_apply_ghat_and_grad(
         ctx: *mut c_void,
         rho_k: *mut c_void,
         exk: *mut c_void,
         eyk: *mut c_void,
         ezk: *mut c_void,
-        kx: *mut c_void,
-        ky: *mut c_void,
-        kz: *mut c_void,
-        bx: *mut c_void,
-        by: *mut c_void,
-        bz: *mut c_void,
+        kx: *const c_void,
+        ky: *const c_void,
+        kz: *const c_void,
+        bx: *const c_void,
+        by: *const c_void,
+        bz: *const c_void,
         nx: i32,
         ny: i32,
         nz: i32,
@@ -97,15 +96,15 @@ unsafe extern "C" {
         nz: i32,
     );
 
-    pub fn vk_spme_energy_half_spectrum_sum(
+    pub fn vk_energy_half_spectrum_sum(
         ctx: *mut c_void,
-        rho_k: *mut c_void,
-        kx: *mut c_void,
-        ky: *mut c_void,
-        kz: *mut c_void,
-        bx: *mut c_void,
-        by: *mut c_void,
-        bz: *mut c_void,
+        rho_k: *const c_void,
+        kx: *const c_void,
+        ky: *const c_void,
+        kz: *const c_void,
+        bx: *const c_void,
+        by: *const c_void,
+        bz: *const c_void,
         nx: i32,
         ny: i32,
         nz: i32,
@@ -127,9 +126,7 @@ impl PmeRecip {
 }
 
 impl PmeRecip {
-    // todo: This may be very slow, i.e. you are making the same mistakes as your initial
-    // todo: cuFFT sim, wherein you keep transfering data to and from the GPU instead
-    // todo of keeping it there.
+    // todo: DRY with the cuFFT version; unify.
     pub fn forces_gpu(
         &mut self,
         // todo: Do we still need VkContext if we are using CudaStream?
@@ -138,6 +135,8 @@ impl PmeRecip {
         pos: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
+        assert_eq!(pos.len(), q.len());
+
         if self.gpu_tables.is_none() {
             // First run
             let k = (&self.kx, &self.ky, &self.kz);
@@ -148,7 +147,10 @@ impl PmeRecip {
             self.gpu_tables = Some(GpuTables::new(k, bmod2, stream));
         }
 
-        assert_eq!(pos.len(), q.len());
+        let cu_stream = stream.cu_stream() as *mut c_void;
+        let tables = self.gpu_tables.as_ref().unwrap();
+        let f32_size = size_of::<f32>();
+
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
@@ -156,31 +158,47 @@ impl PmeRecip {
         let n_cmplx = nx * ny * (nz / 2 + 1); // half-spectrum length
         let complex_len = n_cmplx * 2; // interleaved re,im
 
-        let cu_stream = stream.cu_stream() as *mut c_void;
+        // Contiguous real buffer: [ex | ey | ez]
+        let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
+        let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
+        let base_r = base_r_ptr as usize;
+        let strike_r_bytes = n_real * f32_size;
 
-        let tables = self.gpu_tables.as_ref().unwrap();
+        let ex_ptr = base_r as *mut c_void;
+        let ey_ptr = (base_r + strike_r_bytes) as *mut c_void;
+        let ez_ptr = (base_r + 2 * strike_r_bytes) as *mut c_void;
 
-        let (kx_ptr, _) = tables.kx.device_ptr(stream);
-        let (ky_ptr, _) = tables.ky.device_ptr(stream);
-        let (kz_ptr, _) = tables.kz.device_ptr(stream);
-        let (bx_ptr, _) = tables.bx.device_ptr(stream);
-        let (by_ptr, _) = tables.by.device_ptr(stream);
-        let (bz_ptr, _) = tables.bz.device_ptr(stream);
+        // Contiguous complex buffer: [exk | eyk | ezk]
+        let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
+        let (base_ptr, _) = exeyezk_d.device_ptr(stream);
+        let base = base_ptr as usize;
+        let stride = complex_len * size_of::<f32>();
+
+        let exk_ptr = base as *mut c_void;
+        let eyk_ptr = (base + stride) as *mut c_void;
+        let ezk_ptr = (base + 2 * stride) as *mut c_void;
+
+        let kx_ptr = dev_ptr(&tables.kx, stream);
+        let ky_ptr = dev_ptr(&tables.ky, stream);
+        let kz_ptr = dev_ptr(&tables.kz, stream);
+
+        let bx_ptr = dev_ptr(&tables.bx, stream);
+        let by_ptr = dev_ptr(&tables.by, stream);
+        let bz_ptr = dev_ptr(&tables.bz, stream);
 
         // H2D: positions & charges (flattened)
         let pos_flat: Vec<f32> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
         let pos_d: CudaSlice<f32> = stream.memcpy_stod(&pos_flat).unwrap();
         let q_d: CudaSlice<f32> = stream.memcpy_stod(q).unwrap();
 
-        // real grids (ex|ey|ez) and complex (exk|eyk|ezk)
-        let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
-        let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
+        // rho_real on device
         let rho_real_d: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        // rho(k) (half-spectrum) on device
         let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
 
-        // scatter on device (same kernel as cuFFT)
+        // Scatter on GPU
         unsafe {
-            spme_scatter_rho_4x4x4_launch(
+            scatter_rho_4x4x4_launch(
                 dev_ptr(&pos_d, stream),
                 dev_ptr(&q_d, stream),
                 dev_ptr_mut(&rho_real_d, stream),
@@ -195,83 +213,67 @@ impl PmeRecip {
             );
         }
 
-        // // todo: Why is this a real scatter instead of a complex scatter like
-        // // todo in the GPU branch?
-        // let mut rho_real = vec![0.; n_real];
-        // self.spread_charges_real(pos, q, &mut rho_real);
-
-        // forward R2C
+        // Forward FFT on GPU: real -> half complex
         unsafe {
             vkfft_exec_forward_r2c(
                 self.planner_gpu,
-                dev_ptr(&rho_real_d, stream),
-                dev_ptr(&rho_k_d, stream),
+                dev_ptr_mut(&rho_real_d, stream),
+                dev_ptr_mut(&rho_k_d, stream),
             );
+        }
 
-            // exk/eyk/ezk slices out of exeyezk_d
-            let (base_ptr, _) = exeyezk_d.device_ptr(stream);
-            let base = base_ptr as usize;
-            let stride = complex_len * std::mem::size_of::<f32>();
-            let exk = base as *mut c_void;
-            let eyk = (base + stride) as *mut c_void;
-            let ezk = (base + 2 * stride) as *mut c_void;
-
+        unsafe {
             // apply G(k), grad on device
-            vk_spme_apply_ghat_and_grad(
+            vk_apply_ghat_and_grad(
                 ctx.handle,
-                dev_ptr(&rho_k_d, stream),
-                exk,
-                eyk,
-                ezk,
-                dev_ptr(&tables.kx, stream),
-                dev_ptr(&tables.ky, stream),
-                dev_ptr(&tables.kz, stream),
-                dev_ptr(&tables.bx, stream),
-                dev_ptr(&tables.by, stream),
-                dev_ptr(&tables.bz, stream),
+                dev_ptr_mut(&rho_k_d, stream),
+                exk_ptr,
+                eyk_ptr,
+                ezk_ptr,
+                kx_ptr,
+                ky_ptr,
+                kz_ptr,
+                bx_ptr,
+                by_ptr,
+                bz_ptr,
                 nx as i32,
                 ny as i32,
                 nz as i32,
                 self.vol,
                 self.alpha,
             );
+        }
 
-            // inverse C2R (batched or three calls)
-            let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
-            let base_r = base_r_ptr as usize;
-            let stride_r = n_real * std::mem::size_of::<f32>();
-            let ex = base_r as *mut c_void;
-            let ey = (base_r + stride_r) as *mut c_void;
-            let ez = (base_r + 2 * stride_r) as *mut c_void;
-
+        unsafe {
+            // todo: Make the vk plan many?
             // if your vk plan is "many", add a wrapper; else call 3x:
-            vkfft_exec_inverse_c2r(self.planner_gpu, exk, ex);
-            vkfft_exec_inverse_c2r(self.planner_gpu, eyk, ey);
-            vkfft_exec_inverse_c2r(self.planner_gpu, ezk, ez);
+            vkfft_exec_inverse_c2r(self.planner_gpu, exk_ptr, ex_ptr);
+            vkfft_exec_inverse_c2r(self.planner_gpu, eyk_ptr, ey_ptr);
+            vkfft_exec_inverse_c2r(self.planner_gpu, ezk_ptr, ez_ptr);
 
             // same scaling kernel as cuFFT
-            spme_scale_ExEyEz_after_c2r(
-                ex,
-                ey,
-                ez,
+            scale_ExEyEz_after_c2r(
+                ex_ptr,
+                ey_ptr,
+                ez_ptr,
                 nx as i32,
                 ny as i32,
                 nz as i32,
-                stream.cu_stream() as *mut _,
+                cu_stream,
             );
         }
-
-        // gather on device (same as cuFFT)
+        // Gather forces F = q * E
         let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
         let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
+
         unsafe {
-            spme_gather_forces_to_atoms_launch(
+            gather_forces_to_atoms_launch(
                 dev_ptr(&pos_d, stream),
-                dev_ptr(&ex_ey_ez_d, stream), // ex at offset 0
-                (ex_ey_ez_d.as_device_ptr().0 as usize + n_real * size_of::<f32>()) as *const _,
-                (ex_ey_ez_d.as_device_ptr().0 as usize + 2 * n_real * size_of::<f32>()) as *const _,
+                ex_ptr as *const _,
+                ey_ptr as *const _,
+                ez_ptr as *const _,
                 dev_ptr(&q_d, stream),
-                dev_ptr(&f_d, stream),
+                dev_ptr_mut(&f_d, stream),
                 pos.len() as i32,
                 nx as i32,
                 ny as i32,
@@ -280,13 +282,13 @@ impl PmeRecip {
                 self.box_dims.1,
                 self.box_dims.2,
                 inv_n,
-                stream.cu_stream() as *mut _,
+                cu_stream,
             );
         }
 
         // energy on device (keep your vk reduction)
         let energy = unsafe {
-            vk_spme_energy_half_spectrum_sum(
+            vk_energy_half_spectrum_sum(
                 ctx.handle,
                 dev_ptr(&rho_k_d, stream),
                 dev_ptr(&tables.kx, stream),
@@ -317,6 +319,7 @@ impl PmeRecip {
                 z: f_host[i * 3 + 2],
             });
         }
+
         (f, energy)
     }
 }
@@ -416,6 +419,7 @@ impl PmeRecip {
 //         }
 //     }
 // }
+
 
 /// Create the GPU plan. Run this at init, or when dimensions change.
 pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>) -> *mut c_void {
