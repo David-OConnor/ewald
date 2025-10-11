@@ -1,19 +1,18 @@
 //! We use this to automatically compile CUDA C++ code when building.
 
+#[cfg(feature = "vkfft")]
+use cc;
 #[cfg(feature = "cufft")]
 use cuda_setup::{GpuArchitecture, build_host};
 
-#[cfg(feature = "vkfft")]
-use cc;
-
 fn main() {
     #[cfg(feature = "cufft")]
-        build_host(
-            // Select the min supported GPU architecture.
-            GpuArchitecture::Rtx3,
-            &["src/cuda/spme.cu"],
-            "spme",
-        );
+    build_host(
+        // Select the min supported GPU architecture.
+        GpuArchitecture::Rtx3,
+        &["src/cuda/spme.cu"],
+        "spme",
+    );
 
     #[cfg(feature = "vkfft")]
     {

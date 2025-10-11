@@ -14,8 +14,8 @@
 extern crate core;
 
 use std::f32::consts::{PI, TAU};
-#[cfg(any(feature = "cufft", feature = "vkfft"))]
-use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cufft")]
 mod cufft;
@@ -49,19 +49,17 @@ type Complex_ = Complex<f32>;
 
 /// Initialize this once for the application, or once per step.
 pub struct PmeRecip {
-    nx: usize,
-    ny: usize,
-    nz: usize,
-    /// lx, ly and lz are box-lengths in real space.
-    lx: f32,
-    ly: f32,
-    lz: f32,
+    /// Simultatoin box-lengths in real space.
+    box_dims: (f32, f32, f32),
+    /// FFT planner dimensions. B‑spline interpolation X, Y, Z. These should be based on
+    /// box length, and mesh spacing. nz should be even.
+    plan_dims: (usize, usize, usize),
     vol: f32,
     /// A tunable variable used in the splitting between short range and long range forces.
     /// A bigger α means more damping, and a smaller real-space contribution. (Cheaper real), but larger
     /// reciprocal load.
     pub alpha: f32,
-    // Precomputed k-vectors and B-spline deconvolution |B(k)|^2
+    /// Precomputed k-vectors and B-spline deconvolution |B(k)|^2
     kx: Vec<f32>,
     ky: Vec<f32>,
     kz: Vec<f32>,
@@ -70,16 +68,11 @@ pub struct PmeRecip {
     bmod2_z: Vec<f32>,
     /// For CPU FFTs
     planner: FftPlanner<f32>,
-    #[cfg(feature = "cufft")]
-    planner_gpu: *mut std::ffi::c_void,
-    #[cfg(feature = "vkfft")]
-    planner_gpu: *mut std::ffi::c_void,
-    // todo: Do you want this? Or is it the same as nx, ny, nz?
-    #[cfg(any(feature = "cufft", feature = "vkfft"))]
-    plan_dims: (i32, i32, i32),
-    #[cfg(feature = "cufft")]
-    gpu_tables: Option<GpuTables>,
-    #[cfg(feature = "vkfft")]
+    /// For GPU FFTs
+    #[cfg(feature = "cuda")]
+    planner_gpu: *mut c_void,
+    /// This will be None until the first run. It's based on k and bmod values.
+    #[cfg(feature = "cuda")]
     gpu_tables: Option<GpuTables>,
 }
 
@@ -97,13 +90,12 @@ impl PmeRecip {
         let bmod2_y = spline_bmod2_1d(n.1, SPLINE_ORDER);
         let bmod2_z = spline_bmod2_1d(n.2, SPLINE_ORDER);
 
+        // Note: planner_gpu and gpu_tables will be null/None until the first run. We
+        // handle it this way since the forces fns have access to the stream or Context,
+        // but this construct doens't, if we keep a unified constructor.
         Self {
-            nx: n.0,
-            ny: n.1,
-            nz: n.2,
-            lx: l.0,
-            ly: l.1,
-            lz: l.2,
+            box_dims: l,
+            plan_dims: n,
             vol,
             alpha,
             kx,
@@ -113,41 +105,41 @@ impl PmeRecip {
             bmod2_y,
             bmod2_z,
             planner: FftPlanner::new(),
-            #[cfg(feature = "cufft")]
+            #[cfg(feature = "cuda")]
             planner_gpu: std::ptr::null_mut(),
-            #[cfg(feature = "vkfft")]
-            planner_gpu: std::ptr::null_mut(),
-            #[cfg(any(feature = "cufft", feature = "vkfft"))]
-            plan_dims: (0, 0, 0),
-            #[cfg(feature = "cufft")]
-            gpu_tables: None,
-            #[cfg(feature = "vkfft")]
+            #[cfg(feature = "cuda")]
             gpu_tables: None,
         }
     }
 
+    /// CPU charge spreading.
+    // todo: QC this against the charge spreading you use for GPU.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
-        let nxny = self.nx * self.ny;
+        let (lx, ly, lz) = self.box_dims;
+        let (nx, ny, nz) = self.plan_dims;
+
+        let nxny = nx * ny;
+
         for (r, &qi) in pos.iter().zip(q.iter()) {
-            let sx = r.x / self.lx * self.nx as f32;
-            let sy = r.y / self.ly * self.ny as f32;
-            let sz = r.z / self.lz * self.nz as f32;
+            let sx = r.x / lx * nx as f32;
+            let sy = r.y / ly * ny as f32;
+            let sz = r.z / lz * nz as f32;
 
             let (ix0, wx) = bspline4_weights(sx);
             let (iy0, wy) = bspline4_weights(sy);
             let (iz0, wz) = bspline4_weights(sz);
 
             for a in 0..SPLINE_ORDER {
-                let ix = wrap(ix0 + a as isize, self.nx);
+                let ix = wrap(ix0 + a as isize, nx);
                 let wxa = wx[a];
 
                 for b in 0..SPLINE_ORDER {
-                    let iy = wrap(iy0 + b as isize, self.ny);
+                    let iy = wrap(iy0 + b as isize, ny);
                     let wxy = wxa * wy[b];
 
                     for c in 0..SPLINE_ORDER {
-                        let iz = wrap(iz0 + c as isize, self.nz);
-                        let idx = iz * nxny + iy * self.nx + ix;
+                        let iz = wrap(iz0 + c as isize, nz);
+                        let idx = iz * nxny + iy * nx + ix;
                         rho[idx].re += qi * wxy * wz[c];
                     }
                 }
@@ -155,33 +147,31 @@ impl PmeRecip {
         }
     }
 
-    /// Compute reciprocal-space forces on all positions. Positions must be in the primary box [0,L] per axis.
+    /// Compute reciprocal-space forces on all positions, using the CPU. Positions must be in the
+    /// primary box [0,L] per axis.
     /// todo: Is there a way to exclude static targets, or must all sources be targets?
     pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
 
-        let n_pts = self.nx * self.ny * self.nz;
+        let (lx, ly, lz) = self.box_dims;
+        let (nx, ny, nz) = self.plan_dims;
+
+        let n_pts = nx * ny * nz;
         let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
         self.spread_charges(posits, q, &mut rho);
 
-        fft3_inplace(
-            &mut rho,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            true,
-        );
+        fft3_inplace(&mut rho, self.plan_dims, &mut self.planner, true);
 
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
-        let (nx, ny, _nz) = (self.nx, self.ny, self.nz);
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
         let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
         let (vol, alpha) = (self.vol, self.alpha);
 
         // eAk are per-dimension phase factors.
         // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        let mut exk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
-        let mut eyk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
-        let mut ezk = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
+        let mut exk = vec![Complex::new(0.0, 0.0); n_pts];
+        let mut eyk = vec![Complex::new(0.0, 0.0); n_pts];
+        let mut ezk = vec![Complex::new(0.0, 0.0); n_pts];
 
         let mut energy: f64 = exk
             .par_iter_mut()
@@ -238,32 +228,11 @@ impl PmeRecip {
         // Note: These FFTs are the biggest time bottleneck.
         // let start = Instant::now();
         // Inverse FFT to real-space E grids
-        fft3_inplace(
-            &mut exk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut eyk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
-        fft3_inplace(
-            &mut ezk,
-            (self.nx, self.ny, self.nz),
-            &mut self.planner,
-            false,
-        );
+        fft3_inplace(&mut exk, self.plan_dims, &mut self.planner, false);
+        fft3_inplace(&mut eyk, self.plan_dims, &mut self.planner, false);
+        fft3_inplace(&mut ezk, self.plan_dims, &mut self.planner, false);
 
         // Interpolate E back to particles with the same B-spline weights; F = q E
-        let nx = self.nx;
-        let ny = self.ny;
-        let nz = self.nz;
-        let lx = self.lx;
-        let ly = self.ly;
-        let lz = self.lz;
 
         let f = posits
             .par_iter()
@@ -312,213 +281,6 @@ impl PmeRecip {
         // let energy = 0.5 * q.iter().zip(phi_vals.iter()).map(|(qi, phi)| qi * phi).sum::<f64>();
 
         (f, energy as f32)
-    }
-
-    #[cfg(feature = "cufft")]
-    pub fn forces_gpu_cufft(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        _module: &Arc<CudaModule>,
-        pos: &[Vec3],
-        q: &[f32],
-    ) -> (Vec<Vec3>, f32) {
-        assert_eq!(pos.len(), q.len());
-
-        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
-        let n_real = nx * ny * nz;
-        let n_cmplx = nx * ny * (nz / 2 + 1); // half-spectrum length
-        let complex_len = n_cmplx * 2; // (re,im) interleaved
-
-        // Contiguous real buffer: [ex | ey | ez]
-        let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
-        let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
-        let base_r = base_r_ptr as usize;
-        let stride_r_bytes = n_real * std::mem::size_of::<f32>();
-        let ex_ptr = base_r as *mut std::ffi::c_void;
-        let ey_ptr = (base_r + stride_r_bytes) as *mut std::ffi::c_void;
-        let ez_ptr = (base_r + 2 * stride_r_bytes) as *mut std::ffi::c_void;
-
-        // Contiguous complex buffer: [exk | eyk | ezk]
-        let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
-        let (base_ptr, _) = exeyezk_d.device_ptr(stream);
-        let base = base_ptr as usize;
-        let stride_bytes = complex_len * std::mem::size_of::<f32>();
-        let exk_ptr = base as *mut std::ffi::c_void;
-        let eyk_ptr = (base + stride_bytes) as *mut std::ffi::c_void;
-        let ezk_ptr = (base + 2 * stride_bytes) as *mut std::ffi::c_void;
-
-        self.ensure_gpu_plan(stream);
-        self.ensure_gpu_tables(stream);
-        let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
-
-        // Device tables
-        let tabs = self.gpu_tables.as_ref().unwrap();
-        let (kx_ptr, _) = tabs.kx.device_ptr(stream);
-        let (ky_ptr, _) = tabs.ky.device_ptr(stream);
-        let (kz_ptr, _) = tabs.kz.device_ptr(stream);
-        let (bx_ptr, _) = tabs.bx.device_ptr(stream);
-        let (by_ptr, _) = tabs.by.device_ptr(stream);
-        let (bz_ptr, _) = tabs.bz.device_ptr(stream);
-
-        // H2D: positions & charges (flattened)
-        let pos_flat: Vec<f32> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
-        let pos_d: CudaSlice<f32> = stream.memcpy_stod(&pos_flat).unwrap();
-        let q_d: CudaSlice<f32> = stream.memcpy_stod(q).unwrap();
-        let (pos_ptr, _) = pos_d.device_ptr(stream);
-        let (q_ptr, _) = q_d.device_ptr(stream);
-
-        // rho_real on device
-        let rho_real_d: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let (rho_real_ptr, _) = rho_real_d.device_ptr(stream);
-
-        // Scatter on GPU
-        unsafe {
-            cufft::spme_scatter_rho_4x4x4_launch(
-                pos_ptr as *const _,
-                q_ptr as *const _,
-                rho_real_ptr as *mut _,
-                pos.len() as i32,
-                nx as i32,
-                ny as i32,
-                nz as i32,
-                self.lx,
-                self.ly,
-                self.lz,
-                cu_stream,
-            );
-        }
-
-        // rho(k) (half-spectrum) on device
-        let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let (rho_k_ptr, _) = rho_k_d.device_ptr(stream);
-
-        // Make/refresh R2C/C2R-many plan
-        if self.planner_gpu.is_null() || self.plan_dims != (nx as i32, ny as i32, nz as i32) {
-            unsafe {
-                if !self.planner_gpu.is_null() {
-                    cufft::spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                }
-                self.planner_gpu =
-                    cufft::spme_make_plan_r2c_c2r_many(nx as i32, ny as i32, nz as i32, cu_stream);
-                self.plan_dims = (nx as i32, ny as i32, nz as i32);
-            }
-        }
-
-        // Forward FFT on GPU: real -> half complex
-        unsafe {
-            cufft::spme_exec_forward_r2c(
-                self.planner_gpu,
-                rho_real_ptr as *mut _,
-                rho_k_ptr as *mut _,
-            );
-
-            // Apply G(k) and gradient to get Exk/Eyk/Ezk
-            cufft::spme_apply_ghat_and_grad_launch(
-                rho_k_ptr as *const _,
-                exk_ptr as *mut _,
-                eyk_ptr as *mut _,
-                ezk_ptr as *mut _,
-                kx_ptr as *const _,
-                ky_ptr as *const _,
-                kz_ptr as *const _,
-                bx_ptr as *const _,
-                by_ptr as *const _,
-                bz_ptr as *const _,
-                nx as i32,
-                ny as i32,
-                nz as i32,
-                self.vol,
-                self.alpha,
-                cu_stream,
-            );
-
-            // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
-            cufft::spme_exec_inverse_ExEyEz_c2r(
-                self.planner_gpu,
-                exk_ptr as *mut _,
-                eyk_ptr as *mut _,
-                ezk_ptr as *mut _,
-                ex_ptr as *mut _,
-                ey_ptr as *mut _,
-                ez_ptr as *mut _,
-            );
-
-            // Scale by 1/N once here
-            cufft::spme_scale_ExEyEz_after_c2r(
-                ex_ptr, ey_ptr, ez_ptr, nx as i32, ny as i32, nz as i32, cu_stream,
-            );
-        }
-
-        // Gather forces F = q * E
-        let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
-        let (f_ptr, _) = f_d.device_ptr(stream);
-        let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
-        unsafe {
-            cufft::spme_gather_forces_to_atoms_launch(
-                pos_ptr as *const _,
-                ex_ptr as *const _,
-                ey_ptr as *const _,
-                ez_ptr as *const _,
-                q_ptr as *const _,
-                f_ptr as *mut _,
-                pos.len() as i32,
-                nx as i32,
-                ny as i32,
-                nz as i32,
-                self.lx,
-                self.ly,
-                self.lz,
-                inv_n,
-                cu_stream,
-            );
-        }
-
-        // Energy (half spectrum)
-        let threads = 256i32;
-        let blocks = {
-            let n = n_cmplx as i32;
-            (n + threads - 1) / threads
-        };
-        let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();
-        let (partial_ptr, _) = partial_d.device_ptr(stream);
-        unsafe {
-            cufft::spme_energy_half_spectrum_launch(
-                rho_k_ptr as *const _,
-                kx_ptr as *const _,
-                ky_ptr as *const _,
-                kz_ptr as *const _,
-                bx_ptr as *const _,
-                by_ptr as *const _,
-                bz_ptr as *const _,
-                nx as i32,
-                ny as i32,
-                nz as i32,
-                self.vol,
-                self.alpha,
-                partial_ptr as *mut _,
-                blocks,
-                threads,
-                cu_stream,
-            );
-        }
-        let energy = stream
-            .memcpy_dtov(&partial_d)
-            .unwrap()
-            .into_iter()
-            .sum::<f64>() as f32;
-
-        // D2H forces
-        let f_host: Vec<f32> = stream.memcpy_dtov(&f_d).unwrap();
-        let mut f = Vec::with_capacity(pos.len());
-        for i in 0..pos.len() {
-            f.push(Vec3 {
-                x: f_host[i * 3 + 0],
-                y: f_host[i * 3 + 1],
-                z: f_host[i * 3 + 2],
-            });
-        }
-
-        (f, energy)
     }
 }
 
@@ -599,8 +361,6 @@ fn fft3_inplace(
     forward: bool,
 ) {
     let (nx, ny, nz) = dims;
-    let len = nx * ny * nz;
-    debug_assert_eq!(data.len(), len);
 
     let fft_x = if forward {
         planner.plan_fft_forward(nx)
@@ -668,6 +428,7 @@ fn fft3_inplace(
     // rustfft inverse is unnormalized; many MD codes keep that and balance elsewhere.
     // If you prefer normalized inverse, scale here by 1/(nx*ny*nz) after inverse passes.
     if !forward {
+        let len = nx * ny * nz;
         let scale = 1.0 / (len as f32);
         for v in data.iter_mut() {
             v.re *= scale;

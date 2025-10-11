@@ -3,9 +3,10 @@
 
 // todo: Organize both this and teh .cu file. REmove unused, make order sensitible, and cyn order.
 
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, ptr::null_mut, sync::Arc};
 
-use cudarc::driver::{CudaSlice, CudaStream, sys::CUstream};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, sys::CUstream};
+use lin_alg::f32::Vec3;
 
 use crate::PmeRecip;
 
@@ -116,62 +117,233 @@ unsafe extern "C" {
     );
 }
 
+impl PmeRecip {
+    pub fn forces_gpu(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        pos: &[Vec3],
+        q: &[f32],
+    ) -> (Vec<Vec3>, f32) {
+        if self.gpu_tables.is_none() {
+            // First run
+            let k = (&self.kx, &self.ky, &self.kz);
+            let bmod2 = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
+
+            self.planner_gpu = create_gpu_plan(self.plan_dims, stream);
+            self.gpu_tables = Some(create_gpu_tables(k, bmod2, stream));
+        }
+
+        assert_eq!(pos.len(), q.len());
+
+        let (nx, ny, nz) = self.plan_dims;
+
+        let n_real = nx * ny * nz;
+        let n_cmplx = nx * ny * (nz / 2 + 1); // half-spectrum length
+        let complex_len = n_cmplx * 2; // (re,im) interleaved
+
+        // Contiguous real buffer: [ex | ey | ez]
+        let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
+        let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
+        let base_r = base_r_ptr as usize;
+        let stride_r_bytes = n_real * size_of::<f32>();
+        let ex_ptr = base_r as *mut c_void;
+        let ey_ptr = (base_r + stride_r_bytes) as *mut c_void;
+        let ez_ptr = (base_r + 2 * stride_r_bytes) as *mut c_void;
+
+        // Contiguous complex buffer: [exk | eyk | ezk]
+        let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
+        let (base_ptr, _) = exeyezk_d.device_ptr(stream);
+        let base = base_ptr as usize;
+        let stride_bytes = complex_len * size_of::<f32>();
+
+        let exk_ptr = base as *mut c_void;
+        let eyk_ptr = (base + stride_bytes) as *mut c_void;
+        let ezk_ptr = (base + 2 * stride_bytes) as *mut c_void;
+
+        let cu_stream = stream.cu_stream() as *mut c_void;
+
+        // Device tables
+        let tabs = self.gpu_tables.as_ref().unwrap();
+
+        let (kx_ptr, _) = tabs.kx.device_ptr(stream);
+        let (ky_ptr, _) = tabs.ky.device_ptr(stream);
+        let (kz_ptr, _) = tabs.kz.device_ptr(stream);
+        let (bx_ptr, _) = tabs.bx.device_ptr(stream);
+        let (by_ptr, _) = tabs.by.device_ptr(stream);
+        let (bz_ptr, _) = tabs.bz.device_ptr(stream);
+
+        // H2D: positions & charges (flattened)
+        let pos_flat: Vec<f32> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        let pos_d: CudaSlice<f32> = stream.memcpy_stod(&pos_flat).unwrap();
+        let q_d: CudaSlice<f32> = stream.memcpy_stod(q).unwrap();
+        let (pos_ptr, _) = pos_d.device_ptr(stream);
+        let (q_ptr, _) = q_d.device_ptr(stream);
+
+        // rho_real on device
+        let rho_real_d: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let (rho_real_ptr, _) = rho_real_d.device_ptr(stream);
+
+        // Scatter on GPU
+        unsafe {
+            spme_scatter_rho_4x4x4_launch(
+                pos_ptr as *const _,
+                q_ptr as *const _,
+                rho_real_ptr as *mut _,
+                pos.len() as i32,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.box_dims.0,
+                self.box_dims.1,
+                self.box_dims.2,
+                cu_stream,
+            );
+        }
+
+        // rho(k) (half-spectrum) on device
+        let rho_k_d: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        let (rho_k_ptr, _) = rho_k_d.device_ptr(stream);
+
+        // Make/refresh R2C/C2R-many plan
+        if self.planner_gpu.is_null() || self.plan_dims != (nx as i32, ny as i32, nz as i32) {
+            unsafe {
+                if !self.planner_gpu.is_null() {
+                    spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                }
+                self.planner_gpu =
+                    spme_make_plan_r2c_c2r_many(nx as i32, ny as i32, nz as i32, cu_stream);
+                self.plan_dims = (nx as i32, ny as i32, nz as i32);
+            }
+        }
+
+        // Forward FFT on GPU: real -> half complex
+        unsafe {
+            spme_exec_forward_r2c(
+                self.planner_gpu,
+                rho_real_ptr as *mut _,
+                rho_k_ptr as *mut _,
+            );
+
+            // Apply G(k) and gradient to get Exk/Eyk/Ezk
+            spme_apply_ghat_and_grad_launch(
+                rho_k_ptr as *const _,
+                exk_ptr as *mut _,
+                eyk_ptr as *mut _,
+                ezk_ptr as *mut _,
+                kx_ptr as *const _,
+                ky_ptr as *const _,
+                kz_ptr as *const _,
+                bx_ptr as *const _,
+                by_ptr as *const _,
+                bz_ptr as *const _,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.vol,
+                self.alpha,
+                cu_stream,
+            );
+
+            // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
+            spme_exec_inverse_ExEyEz_c2r(
+                self.planner_gpu,
+                exk_ptr as *mut _,
+                eyk_ptr as *mut _,
+                ezk_ptr as *mut _,
+                ex_ptr as *mut _,
+                ey_ptr as *mut _,
+                ez_ptr as *mut _,
+            );
+
+            // Scale by 1/N once here
+            spme_scale_ExEyEz_after_c2r(
+                ex_ptr, ey_ptr, ez_ptr, nx as i32, ny as i32, nz as i32, cu_stream,
+            );
+        }
+
+        // Gather forces F = q * E
+        let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
+        let (f_ptr, _) = f_d.device_ptr(stream);
+        let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
+        unsafe {
+            spme_gather_forces_to_atoms_launch(
+                pos_ptr as *const _,
+                ex_ptr as *const _,
+                ey_ptr as *const _,
+                ez_ptr as *const _,
+                q_ptr as *const _,
+                f_ptr as *mut _,
+                pos.len() as i32,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.box_dims.0,
+                self.box_dims.1,
+                self.box_dims.2,
+                inv_n,
+                cu_stream,
+            );
+        }
+
+        // Energy (half spectrum)
+        let threads = 256i32;
+        let blocks = {
+            let n = n_cmplx as i32;
+            (n + threads - 1) / threads
+        };
+        let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();
+        let (partial_ptr, _) = partial_d.device_ptr(stream);
+        unsafe {
+            spme_energy_half_spectrum_launch(
+                rho_k_ptr as *const _,
+                kx_ptr as *const _,
+                ky_ptr as *const _,
+                kz_ptr as *const _,
+                bx_ptr as *const _,
+                by_ptr as *const _,
+                bz_ptr as *const _,
+                nx as i32,
+                ny as i32,
+                nz as i32,
+                self.vol,
+                self.alpha,
+                partial_ptr as *mut _,
+                blocks,
+                threads,
+                cu_stream,
+            );
+        }
+        let energy = stream
+            .memcpy_dtov(&partial_d)
+            .unwrap()
+            .into_iter()
+            .sum::<f64>() as f32;
+
+        // D2H forces
+        let f_host: Vec<f32> = stream.memcpy_dtov(&f_d).unwrap();
+        let mut f = Vec::with_capacity(pos.len());
+        for i in 0..pos.len() {
+            f.push(Vec3 {
+                x: f_host[i * 3 + 0],
+                y: f_host[i * 3 + 1],
+                z: f_host[i * 3 + 2],
+            });
+        }
+
+        (f, energy)
+    }
+}
+
 impl Drop for PmeRecip {
     fn drop(&mut self) {
         unsafe {
             if !self.planner_gpu.is_null() {
                 spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                self.planner_gpu = std::ptr::null_mut();
+                self.planner_gpu = null_mut();
             }
         }
     }
 }
-
-impl PmeRecip {
-    pub fn ensure_gpu_plan(&mut self, stream: &Arc<CudaStream>) {
-        use std::ffi::c_void;
-        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
-
-        let cu_stream: CUstream = stream.cu_stream();
-        let raw_stream: *mut c_void = cu_stream as *mut c_void;
-
-        unsafe {
-            if self.planner_gpu.is_null() || self.plan_dims != dims {
-                if !self.planner_gpu.is_null() {
-                    spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
-                    self.planner_gpu = std::ptr::null_mut();
-                }
-                self.planner_gpu = spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
-                self.plan_dims = dims;
-
-                {
-                    self.gpu_tables = None;
-                }
-            }
-        }
-    }
-}
-
-impl PmeRecip {
-    pub fn ensure_gpu_tables(&mut self, stream: &Arc<CudaStream>) {
-        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
-        if self.plan_dims != dims {
-            return;
-        }
-
-        if self.gpu_tables.is_none() {
-            self.gpu_tables = Some(GpuTables {
-                kx: stream.memcpy_stod(&self.kx).unwrap(),
-                ky: stream.memcpy_stod(&self.ky).unwrap(),
-                kz: stream.memcpy_stod(&self.kz).unwrap(),
-                bx: stream.memcpy_stod(&self.bmod2_x).unwrap(),
-                by: stream.memcpy_stod(&self.bmod2_y).unwrap(),
-                bz: stream.memcpy_stod(&self.bmod2_z).unwrap(),
-            });
-        }
-    }
-}
-
 
 pub(crate) struct GpuTables {
     pub kx: CudaSlice<f32>,
@@ -180,4 +352,31 @@ pub(crate) struct GpuTables {
     pub bx: CudaSlice<f32>,
     pub by: CudaSlice<f32>,
     pub bz: CudaSlice<f32>,
+}
+
+/// Create the GPU plan. Run this at init, or when dimensions change.
+pub(crate) fn create_gpu_plan(
+    dims: (usize, usize, usize),
+    stream: &Arc<CudaStream>,
+) -> *mut c_void {
+    let raw_stream: *mut c_void = stream.cu_stream() as *mut c_void;
+
+    let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
+
+    unsafe { spme_make_plan_r2c_c2r_many(nx, ny, nz, raw_stream) }
+}
+
+pub(crate) fn create_gpu_tables(
+    k: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+    bmod2: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+    stream: &Arc<CudaStream>,
+) -> GpuTables {
+    GpuTables {
+        kx: stream.memcpy_stod(k.0).unwrap(),
+        ky: stream.memcpy_stod(k.1).unwrap(),
+        kz: stream.memcpy_stod(k.2).unwrap(),
+        bx: stream.memcpy_stod(bmod2.0).unwrap(),
+        by: stream.memcpy_stod(bmod2.1).unwrap(),
+        bz: stream.memcpy_stod(bmod2.2).unwrap(),
+    }
 }

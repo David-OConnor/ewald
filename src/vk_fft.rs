@@ -1,4 +1,4 @@
-use std::{ffi::c_void, mem::size_of, sync::Arc};
+use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::Arc};
 
 use cudarc::driver::{CudaStream, sys::CUstream};
 use lin_alg::f32::Vec3;
@@ -23,10 +23,13 @@ impl Default for VkContext {
 
 impl VkContext {
     /// Adopt an existing cudarc stream (we will NOT destroy it).
-    pub fn from_cudarc_stream(stream: &std::sync::Arc<CudaStream>) -> Self {
+    pub fn from_cudarc_stream(stream: &Arc<CudaStream>) -> Self {
         let cu: CUstream = stream.cu_stream();
         let handle = unsafe { vk_make_context_from_stream(cu as *mut c_void) };
-        assert!(!handle.is_null(), "vk_make_context_from_stream returned null");
+        assert!(
+            !handle.is_null(),
+            "vk_make_context_from_stream returned null"
+        );
         VkContext { handle }
     }
 }
@@ -50,6 +53,7 @@ unsafe extern "C" {
         real_in_dev: *mut c_void,
         complex_out_dev: *mut c_void,
     );
+
     pub fn vkfft_exec_inverse_c2r(
         plan: *mut c_void,
         complex_in_dev: *mut c_void,
@@ -114,111 +118,37 @@ impl PmeRecip {
     }
 }
 
-pub(crate) struct GpuTables {
-    kx: *mut c_void,
-    ky: *mut c_void,
-    kz: *mut c_void,
-    bx: *mut c_void,
-    by: *mut c_void,
-    bz: *mut c_void,
-}
-
-impl Default for GpuTables {
-    fn default() -> Self {
-        Self {
-            kx: std::ptr::null_mut(),
-            ky: std::ptr::null_mut(),
-            kz: std::ptr::null_mut(),
-            bx: std::ptr::null_mut(),
-            by: std::ptr::null_mut(),
-            bz: std::ptr::null_mut(),
-        }
-    }
-}
-
 impl PmeRecip {
-    fn ensure_vkfft_plan(&mut self, ctx: &Arc<VkContext>) {
-        let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
-        unsafe {
-            if self.planner_gpu.is_null() || self.plan_dims != dims {
-                if !self.planner_gpu.is_null() {
-                    vkfft_destroy_plan(self.planner_gpu);
-                    self.planner_gpu = std::ptr::null_mut();
-                }
-                self.planner_gpu =
-                    vkfft_make_plan_r2c_c2r_many(ctx.handle, dims.0, dims.1, dims.2);
-                self.plan_dims = dims;
-                self.gpu_tables = None;
-            }
-        }
-    }
-
-    fn ensure_vk_tables(&mut self, ctx: &Arc<VkContext>) {
-        if self.gpu_tables.is_some() {
-            return;
-        }
-        unsafe {
-            let kx = vk_alloc_and_upload(
-                ctx.handle,
-                self.kx.as_ptr() as *const u8,
-                (self.kx.len() * size_of::<f32>()) as u64,
-            );
-            let ky = vk_alloc_and_upload(
-                ctx.handle,
-                self.ky.as_ptr() as *const u8,
-                (self.ky.len() * size_of::<f32>()) as u64,
-            );
-            let kz = vk_alloc_and_upload(
-                ctx.handle,
-                self.kz.as_ptr() as *const u8,
-                (self.kz.len() * size_of::<f32>()) as u64,
-            );
-            let bx = vk_alloc_and_upload(
-                ctx.handle,
-                self.bmod2_x.as_ptr() as *const u8,
-                (self.bmod2_x.len() * size_of::<f32>()) as u64,
-            );
-            let by = vk_alloc_and_upload(
-                ctx.handle,
-                self.bmod2_y.as_ptr() as *const u8,
-                (self.bmod2_y.len() * size_of::<f32>()) as u64,
-            );
-            let bz = vk_alloc_and_upload(
-                ctx.handle,
-                self.bmod2_z.as_ptr() as *const u8,
-                (self.bmod2_z.len() * size_of::<f32>()) as u64,
-            );
-            self.gpu_tables = Some(GpuTables {
-                kx,
-                ky,
-                kz,
-                bx,
-                by,
-                bz,
-            });
-        }
-    }
-}
-
-impl PmeRecip {
+    // todo: This may be very slow, i.e. you are making the same mistakes as your initial
+    // todo: cuFFT sim, wherein you keep transfering data to and from the GPU instead
+    // todo of keeping it there.
     pub fn forces_gpu(
         &mut self,
         ctx: &Arc<VkContext>,
         pos: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
+        if self.gpu_tables.is_none() {
+            // First run
+            let k = (&self.kx, &self.ky, &self.kz);
+            let bmod2 = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
+
+            self.planner_gpu = create_gpu_plan(self.plan_dims, ctx);
+            self.gpu_tables = Some(create_gpu_tables(k, bmod2, ctx));
+        }
+
         assert_eq!(pos.len(), q.len());
-        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let (lx, ly, lz) = self.box_dims;
+        let (nx, ny, nz) = self.plan_dims;
+
         let n_real = nx * ny * nz;
         let n_cmplx = nx * ny * (nz / 2 + 1);
         let complex_len = n_cmplx * 2; // interleaved re,im
 
-        self.ensure_vkfft_plan(ctx);
-        self.ensure_vk_tables(ctx);
         let tabs = self.gpu_tables.as_ref().unwrap();
 
         // Host scatter (keep it simple; you can port your GPU scatter later)
-        let mut rho_real = vec![0f32; n_real];
+        let mut rho_real = vec![0.; n_real];
         self.spread_charges_real(pos, q, &mut rho_real);
 
         unsafe {
@@ -283,12 +213,14 @@ impl PmeRecip {
                 .iter()
                 .enumerate()
                 .map(|(i, &r)| {
-                    let (ix0, wx) = bspline4_weights(r.x / self.lx * nx as f32);
-                    let (iy0, wy) = bspline4_weights(r.y / self.ly * ny as f32);
-                    let (iz0, wz) = bspline4_weights(r.z / self.lz * nz as f32);
+                    let (ix0, wx) = bspline4_weights(r.x / lx * nx as f32);
+                    let (iy0, wy) = bspline4_weights(r.y / ly * ny as f32);
+                    let (iz0, wz) = bspline4_weights(r.z / lz * nz as f32);
+
                     let mut ex = 0.0f64;
                     let mut ey = 0.0f64;
                     let mut ez = 0.0f64;
+
                     let nxny = nx * ny;
                     for a in 0..4 {
                         let ix = wrap(ix0 + a as isize, nx);
@@ -321,12 +253,10 @@ impl PmeRecip {
                 nx as i32, ny as i32, nz as i32, self.vol, self.alpha,
             ) as f32;
 
-            // Self-energy
             let self_energy: f64 = -(self.alpha as f64 / SQRT_PI as f64)
                 * q.iter().map(|&qi| (qi as f64) * (qi as f64)).sum::<f64>();
             let energy = (energy as f64 + self_energy) as f32;
 
-            // Free
             vk_free(ctx.handle, rho_real_d);
             vk_free(ctx.handle, rho_k_d);
             vk_free(ctx.handle, exk_d);
@@ -343,29 +273,98 @@ impl PmeRecip {
     /// todo: Compare this to spread_charges (cplx version) in lib.rs. Figure out why you need
     /// todo this for vkfft, but use the cplx version there.
     fn spread_charges_real(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
-        let nxny = self.nx * self.ny;
+        let (lx, ly, lz) = (self.box_dims.0, self.box_dims.1, self.box_dims.2);
+
+        let (nx, ny, nz) = (self.plan_dims.0, self.plan_dims.1, self.plan_dims.2);
+
+        let nxny = nx * ny;
+
         for (r, &qi) in pos.iter().zip(q.iter()) {
-            let sx = r.x / self.lx * self.nx as f32;
-            let sy = r.y / self.ly * self.ny as f32;
-            let sz = r.z / self.lz * self.nz as f32;
+            let sx = r.x / lx * nx as f32;
+            let sy = r.y / ly * ny as f32;
+            let sz = r.z / lz * nz as f32;
 
             let (ix0, wx) = bspline4_weights(sx);
             let (iy0, wy) = bspline4_weights(sy);
             let (iz0, wz) = bspline4_weights(sz);
 
             for a in 0..4 {
-                let ix = wrap(ix0 + a as isize, self.nx);
+                let ix = wrap(ix0 + a as isize, nx);
                 let wxa = wx[a];
                 for b in 0..4 {
-                    let iy = wrap(iy0 + b as isize, self.ny);
+                    let iy = wrap(iy0 + b as isize, ny);
                     let wxy = wxa * wy[b];
                     for c in 0..4 {
-                        let iz = wrap(iz0 + c as isize, self.nz);
-                        let idx = iz * nxny + iy * self.nx + ix;
+                        let iz = wrap(iz0 + c as isize, nz);
+                        let idx = iz * nxny + iy * nx + ix;
                         rho[idx] += qi * wxy * wz[c];
                     }
                 }
             }
+        }
+    }
+}
+
+// todo: Can we make this CudaSlice<f32> instead of c_void, like we do with cuFFT?
+pub(crate) struct GpuTables {
+    kx: *mut c_void,
+    ky: *mut c_void,
+    kz: *mut c_void,
+    bx: *mut c_void,
+    by: *mut c_void,
+    bz: *mut c_void,
+}
+
+/// Create the GPU plan. Run this at init, or when dimensions change.
+pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>) -> *mut c_void {
+    let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
+
+    unsafe { vkfft_make_plan_r2c_c2r_many(ctx.handle, nx, ny, nz) }
+}
+
+pub(crate) fn create_gpu_tables(
+    k: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+    bmod2: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+    ctx: &Arc<VkContext>,
+) -> GpuTables {
+    unsafe {
+        let kx = vk_alloc_and_upload(
+            ctx.handle,
+            k.0.as_ptr() as *const u8,
+            (k.0.len() * size_of::<f32>()) as u64,
+        );
+        let ky = vk_alloc_and_upload(
+            ctx.handle,
+            k.1.as_ptr() as *const u8,
+            (k.1.len() * size_of::<f32>()) as u64,
+        );
+        let kz = vk_alloc_and_upload(
+            ctx.handle,
+            k.2.as_ptr() as *const u8,
+            (k.2.len() * size_of::<f32>()) as u64,
+        );
+        let bx = vk_alloc_and_upload(
+            ctx.handle,
+            bmod2.0.as_ptr() as *const crate::vk_fft::vk_alloc_and_upload,
+            (bmod2.0.len() * size_of::<f32>()) as u64,
+        );
+        let by = vk_alloc_and_upload(
+            ctx.handle,
+            bmod2.1.as_ptr() as *const u8,
+            (bmod2.1.len() * size_of::<f32>()) as u64,
+        );
+        let bz = vk_alloc_and_upload(
+            ctx.handle,
+            bmod2.2.as_ptr() as *const u8,
+            (bmod2.2.len() * size_of::<f32>()) as u64,
+        );
+        GpuTables {
+            kx,
+            ky,
+            kz,
+            bx,
+            by,
+            bz,
         }
     }
 }
