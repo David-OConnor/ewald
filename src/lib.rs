@@ -23,18 +23,17 @@ mod cufft;
 pub mod vk_fft;
 
 #[cfg(feature = "cufft")]
-use cudarc::driver::CudaSlice;
-#[cfg(feature = "cufft")]
-use cudarc::driver::{CudaModule, CudaStream, DevicePtr};
+use cudarc::driver::DevicePtr;
+use cudarc::driver::{CudaSlice, CudaStream};
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
-#[cfg(feature = "cufft")]
-use crate::cufft::GpuTables;
-#[cfg(feature = "vkfft")]
-use crate::vk_fft::GpuTables;
+// #[cfg(feature = "cufft")]
+// use crate::cufft::GpuTables;
+// #[cfg(feature = "vkfft")]
+// use crate::vk_fft::GpuTables;
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -152,7 +151,6 @@ impl PmeRecip {
     /// todo: Is there a way to exclude static targets, or must all sources be targets?
     pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
-
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
@@ -529,4 +527,45 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
+}
+
+/// Used by both VkFFT and cuFFT.
+#[cfg(feature = "cuda")]
+pub(crate) struct GpuTables {
+    pub kx: CudaSlice<f32>,
+    pub ky: CudaSlice<f32>,
+    pub kz: CudaSlice<f32>,
+    pub bx: CudaSlice<f32>,
+    pub by: CudaSlice<f32>,
+    pub bz: CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuTables {
+    pub(crate) fn new(
+        k: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+        bmod2: (&Vec<f32>, &Vec<f32>, &Vec<f32>),
+        stream: &Arc<CudaStream>,
+    ) -> Self {
+        Self {
+            kx: stream.memcpy_stod(k.0).unwrap(),
+            ky: stream.memcpy_stod(k.1).unwrap(),
+            kz: stream.memcpy_stod(k.2).unwrap(),
+            bx: stream.memcpy_stod(bmod2.0).unwrap(),
+            by: stream.memcpy_stod(bmod2.1).unwrap(),
+            bz: stream.memcpy_stod(bmod2.2).unwrap(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dev_ptr<T>(buf: &CudaSlice<T>, stream: &Arc<CudaStream>) -> *const c_void {
+    let (p, _) = buf.device_ptr(stream);
+    p as *mut c_void
+}
+
+#[cfg(feature = "cuda")]
+fn dev_ptr_mut<T>(buf: &CudaSlice<T>, stream: &Arc<CudaStream>) -> *mut c_void {
+    let (p, _) = buf.device_ptr(stream);
+    p as *mut c_void
 }

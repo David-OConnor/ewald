@@ -94,27 +94,27 @@ static void download(VkContext* c, VkBuf* b, void* dst, size_t n) {
 void* vk_make_context_default(void) { return make_default_ctx(); }
 void vk_destroy_context(void* ctx) { destroy_ctx((VkContext*)ctx); }
 
-void* vk_alloc_and_upload(void* ctx, const void* host_src, uint64_t nbytes) {
-    VkContext* c = (VkContext*)ctx;
-    VkBuf* b = alloc_host_visible(c, (size_t)nbytes, 0);
-    upload(c, b, host_src, (size_t)nbytes);
-    return b;
-}
-
-void* vk_alloc_zeroed(void* ctx, uint64_t nbytes) {
-    VkContext* c = (VkContext*)ctx;
-    return alloc_host_visible(c, (size_t)nbytes, 1);
-}
-
-void vk_download(void* ctx, void* dev_buf, void* host_dst, uint64_t nbytes) {
-    VkContext* c = (VkContext*)ctx;
-    download(c, (VkBuf*)dev_buf, host_dst, (size_t)nbytes);
-}
-
-void vk_free(void* ctx, void* dev_buf) {
-    VkContext* c = (VkContext*)ctx;
-    free_buf(c, (VkBuf*)dev_buf);
-}
+//void* vk_alloc_and_upload(void* ctx, const void* host_src, uint64_t nbytes) {
+//    VkContext* c = (VkContext*)ctx;
+//    VkBuf* b = alloc_host_visible(c, (size_t)nbytes, 0);
+//    upload(c, b, host_src, (size_t)nbytes);
+//    return b;
+//}
+//
+//void* vk_alloc_zeroed(void* ctx, uint64_t nbytes) {
+//    VkContext* c = (VkContext*)ctx;
+//    return alloc_host_visible(c, (size_t)nbytes, 1);
+//}
+//
+//void vk_download(void* ctx, void* dev_buf, void* host_dst, uint64_t nbytes) {
+//    VkContext* c = (VkContext*)ctx;
+//    download(c, (VkBuf*)dev_buf, host_dst, (size_t)nbytes);
+//}
+//
+//void vk_free(void* ctx, void* dev_buf) {
+//    VkContext* c = (VkContext*)ctx;
+//    free_buf(c, (VkBuf*)dev_buf);
+//}
 
 void* vkfft_make_plan_r2c_c2r_many(void* ctx, int32_t nx, int32_t ny, int32_t nz) {
     VkContext* c = (VkContext*)ctx;
