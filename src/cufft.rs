@@ -7,7 +7,7 @@ use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaSlice, CudaStream, sys::CUstream};
 
-use crate::{GpuTables, PmeRecip, cufft};
+use crate::PmeRecip;
 
 unsafe extern "C" {
     pub(crate) fn spme_make_plan_r2c_c2r_many(
@@ -143,7 +143,7 @@ impl PmeRecip {
                 }
                 self.planner_gpu = spme_make_plan_r2c_c2r_many(dims.0, dims.1, dims.2, raw_stream);
                 self.plan_dims = dims;
-                #[cfg(feature = "cuda")]
+
                 {
                     self.gpu_tables = None;
                 }
@@ -170,4 +170,14 @@ impl PmeRecip {
             });
         }
     }
+}
+
+
+pub(crate) struct GpuTables {
+    pub kx: CudaSlice<f32>,
+    pub ky: CudaSlice<f32>,
+    pub kz: CudaSlice<f32>,
+    pub bx: CudaSlice<f32>,
+    pub by: CudaSlice<f32>,
+    pub bz: CudaSlice<f32>,
 }

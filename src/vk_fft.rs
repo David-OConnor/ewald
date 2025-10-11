@@ -98,11 +98,11 @@ unsafe extern "C" {
 impl PmeRecip {
     // vkFFT plan handle + cached dims
     pub(crate) fn vk_plan_ptr(&self) -> *mut c_void {
-        self.planner_gpu_vk
+        self.planner_gpu
     }
 }
 
-pub(crate) struct GpuTablesVk {
+pub(crate) struct GpuTables {
     kx: *mut c_void,
     ky: *mut c_void,
     kz: *mut c_void,
@@ -111,7 +111,7 @@ pub(crate) struct GpuTablesVk {
     bz: *mut c_void,
 }
 
-impl Default for GpuTablesVk {
+impl Default for GpuTables {
     fn default() -> Self {
         Self {
             kx: std::ptr::null_mut(),
@@ -128,21 +128,21 @@ impl PmeRecip {
     fn ensure_vkfft_plan(&mut self, ctx: &Arc<VkContext>) {
         let dims = (self.nx as i32, self.ny as i32, self.nz as i32);
         unsafe {
-            if self.planner_gpu_vk.is_null() || self.plan_dims != dims {
-                if !self.planner_gpu_vk.is_null() {
-                    vkfft_destroy_plan(self.planner_gpu_vk);
-                    self.planner_gpu_vk = std::ptr::null_mut();
+            if self.planner_gpu.is_null() || self.plan_dims != dims {
+                if !self.planner_gpu.is_null() {
+                    vkfft_destroy_plan(self.planner_gpu);
+                    self.planner_gpu = std::ptr::null_mut();
                 }
-                self.planner_gpu_vk =
+                self.planner_gpu =
                     vkfft_make_plan_r2c_c2r_many(ctx.handle, dims.0, dims.1, dims.2);
                 self.plan_dims = dims;
-                self.gpu_tables_vk = None;
+                self.gpu_tables = None;
             }
         }
     }
 
     fn ensure_vk_tables(&mut self, ctx: &Arc<VkContext>) {
-        if self.gpu_tables_vk.is_some() {
+        if self.gpu_tables.is_some() {
             return;
         }
         unsafe {
@@ -176,7 +176,7 @@ impl PmeRecip {
                 self.bmod2_z.as_ptr() as *const u8,
                 (self.bmod2_z.len() * size_of::<f32>()) as u64,
             );
-            self.gpu_tables_vk = Some(GpuTablesVk {
+            self.gpu_tables = Some(GpuTables {
                 kx,
                 ky,
                 kz,
@@ -203,7 +203,7 @@ impl PmeRecip {
 
         self.ensure_vkfft_plan(ctx);
         self.ensure_vk_tables(ctx);
-        let tabs = self.gpu_tables_vk.as_ref().unwrap();
+        let tabs = self.gpu_tables.as_ref().unwrap();
 
         // Host scatter (keep it simple; you can port your GPU scatter later)
         let mut rho_real = vec![0f32; n_real];
@@ -219,7 +219,7 @@ impl PmeRecip {
             let rho_k_d = vk_alloc_zeroed(ctx.handle, (complex_len * size_of::<f32>()) as u64);
 
             // Exec forward R2C
-            vkfft_exec_forward_r2c(self.planner_gpu_vk, rho_real_d, rho_k_d);
+            vkfft_exec_forward_r2c(self.planner_gpu, rho_real_d, rho_k_d);
 
             // Allocate exk,eyk,ezk (complex half-spectra, interleaved)
             let exk_d = vk_alloc_zeroed(ctx.handle, (complex_len * size_of::<f32>()) as u64);
@@ -237,9 +237,9 @@ impl PmeRecip {
             let ey_d = vk_alloc_zeroed(ctx.handle, (n_real * size_of::<f32>()) as u64);
             let ez_d = vk_alloc_zeroed(ctx.handle, (n_real * size_of::<f32>()) as u64);
 
-            vkfft_exec_inverse_c2r(self.planner_gpu_vk, exk_d, ex_d);
-            vkfft_exec_inverse_c2r(self.planner_gpu_vk, eyk_d, ey_d);
-            vkfft_exec_inverse_c2r(self.planner_gpu_vk, ezk_d, ez_d);
+            vkfft_exec_inverse_c2r(self.planner_gpu, exk_d, ex_d);
+            vkfft_exec_inverse_c2r(self.planner_gpu, eyk_d, ey_d);
+            vkfft_exec_inverse_c2r(self.planner_gpu, ezk_d, ez_d);
 
             // Scale by 1/N
             vk_spme_scale_real_fields(ex_d, ey_d, ez_d, nx as i32, ny as i32, nz as i32);

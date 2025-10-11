@@ -38,5 +38,5 @@ cc = "1.2.41"
 
 
 [features]
-cuda = ["cuda_setup", "cudarc", "lin_alg/cuda"]
-cufft = ["cuda"]
+cufft = ["cuda_setup", "cudarc", "lin_alg/cuda"]
+vkfft = []

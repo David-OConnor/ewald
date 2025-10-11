@@ -14,25 +14,27 @@
 extern crate core;
 
 use std::f32::consts::{PI, TAU};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cufft", feature = "vkfft"))]
 use std::sync::Arc;
 
-#[cfg(feature = "cfft")]
+#[cfg(feature = "cufft")]
 mod cufft;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "vkfft")]
 pub mod vk_fft;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cufft")]
 use cudarc::driver::CudaSlice;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cufft")]
 use cudarc::driver::{CudaModule, CudaStream, DevicePtr};
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
-#[cfg(feature = "cuda")]
-use crate::vk_fft::GpuTablesVk;
+#[cfg(feature = "cufft")]
+use crate::cufft::GpuTables;
+#[cfg(feature = "vkfft")]
+use crate::vk_fft::GpuTables;
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -68,17 +70,17 @@ pub struct PmeRecip {
     bmod2_z: Vec<f32>,
     /// For CPU FFTs
     planner: FftPlanner<f32>,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cufft")]
     planner_gpu: *mut std::ffi::c_void,
-    #[cfg(feature = "cuda")]
-    planner_gpu_vk: *mut std::ffi::c_void,
+    #[cfg(feature = "vkfft")]
+    planner_gpu: *mut std::ffi::c_void,
     // todo: Do you want this? Or is it the same as nx, ny, nz?
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cufft", feature = "vkfft"))]
     plan_dims: (i32, i32, i32),
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cufft")]
     gpu_tables: Option<GpuTables>,
-    #[cfg(feature = "cuda")]
-    gpu_tables_vk: Option<GpuTablesVk>,
+    #[cfg(feature = "vkfft")]
+    gpu_tables: Option<GpuTables>,
 }
 
 impl PmeRecip {
@@ -111,16 +113,16 @@ impl PmeRecip {
             bmod2_y,
             bmod2_z,
             planner: FftPlanner::new(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "cufft")]
             planner_gpu: std::ptr::null_mut(),
-            #[cfg(feature = "cuda")]
-            planner_gpu_vk: std::ptr::null_mut(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "vkfft")]
+            planner_gpu: std::ptr::null_mut(),
+            #[cfg(any(feature = "cufft", feature = "vkfft"))]
             plan_dims: (0, 0, 0),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "cufft")]
             gpu_tables: None,
-            #[cfg(feature = "cuda")]
-            gpu_tables_vk: None,
+            #[cfg(feature = "vkfft")]
+            gpu_tables: None,
         }
     }
 
@@ -766,14 +768,4 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) struct GpuTables {
-    pub kx: CudaSlice<f32>,
-    pub ky: CudaSlice<f32>,
-    pub kz: CudaSlice<f32>,
-    pub bx: CudaSlice<f32>,
-    pub by: CudaSlice<f32>,
-    pub bz: CudaSlice<f32>,
 }
