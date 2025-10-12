@@ -6,9 +6,9 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::PmeRecip;
 #[cfg(feature = "cufft")]
-use crate::cufft::spme_destroy_plan_r2c_c2r_many;
+use crate::cufft::destroy_plan_r2c_c2r_many;
 #[cfg(feature = "vkfft")]
-use crate::vk_fft::vkfft_destroy_plan;
+use crate::vk_fft::destroy_plan;
 
 pub(crate) struct GpuTables {
     pub kx: CudaSlice<f32>,
@@ -85,9 +85,9 @@ impl Drop for PmeRecip {
         unsafe {
             if !self.planner_gpu.is_null() {
                 #[cfg(feature = "vkfft")]
-                vkfft_destroy_plan(self.planner_gpu);
+                destroy_plan(self.planner_gpu);
                 #[cfg(feature = "cufft")]
-                spme_destroy_plan_r2c_c2r_many(self.planner_gpu);
+                destroy_plan_r2c_c2r_many(self.planner_gpu);
                 self.planner_gpu = std::ptr::null_mut();
             }
         }

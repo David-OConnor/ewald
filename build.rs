@@ -35,8 +35,5 @@ fn main() {
             .flag_if_supported("-O3")
             .warnings(false)
             .compile("vk_fft");
-
-        // println!("cargo:rustc-link-lib=nvcuda");
-        // println!("cargo:rustc-link-lib=cudart"); // todo: Is this required?
     }
 }

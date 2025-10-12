@@ -20,14 +20,14 @@ use crate::{
 use crate::gpu_shared::split3;
 
 unsafe extern "C" {
-    pub(crate) fn spme_make_plan_r2c_c2r_many(
+    pub(crate) fn make_plan_r2c_c2r_many(
         nx: i32,
         ny: i32,
         nz: i32,
         cu_stream: *mut c_void,
     ) -> *mut c_void;
 
-    pub(crate) fn spme_exec_inverse_ExEyEz_c2r(
+    pub(crate) fn exec_inverse_ExEyEz_c2r(
         plan: *mut c_void,
         exk: *mut c_void, // cufftComplex*
         eyk: *mut c_void,
@@ -56,7 +56,7 @@ unsafe extern "C" {
         cu_stream: *mut c_void,
     );
 
-    pub(crate) fn spme_destroy_plan_r2c_c2r_many(plan: *mut c_void);
+    pub(crate) fn destroy_plan_r2c_c2r_many(plan: *mut c_void);
 
     pub(crate) fn energy_half_spectrum_launch(
         rho_k: *const c_void,
@@ -184,7 +184,7 @@ impl PmeRecip {
             );
 
             // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
-            spme_exec_inverse_ExEyEz_c2r(
+            exec_inverse_ExEyEz_c2r(
                 self.planner_gpu,
                 exk_ptr as *mut _,
                 eyk_ptr as *mut _,
@@ -282,5 +282,5 @@ pub(crate) fn create_gpu_plan(
 
     let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
 
-    unsafe { spme_make_plan_r2c_c2r_many(nx, ny, nz, raw_stream) }
+    unsafe { make_plan_r2c_c2r_many(nx, ny, nz, raw_stream) }
 }

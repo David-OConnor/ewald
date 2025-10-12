@@ -2,8 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <cuda.h>      // Driver API
+
+#define VKFFT_BACKEND 1  // CUDA // todo: Probably not required, as set in build system.
 #include "vkFFT.h"     // third-party library header (VkFFTApplication, etc.)
 #include "vk_fft.h"    // your FFI header (prototypes above)
+
+
 
 typedef struct {
     CUdevice  dev;
@@ -63,7 +67,7 @@ void vk_destroy_context(void* ctx_) {
     free(c);
 }
 
-void* vkfft_make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
+void* make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
     VkContext* c = (VkContext*)ctx_;
     VkFftPlan* p = (VkFftPlan*)calloc(1, sizeof(VkFftPlan));
     p->Nx = (uint64_t)nx; p->Ny = (uint64_t)ny; p->Nz = (uint64_t)nz;
@@ -89,7 +93,7 @@ void* vkfft_make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t n
     return p;
 }
 
-void vkfft_destroy_plan(void* plan_) {
+void destroy_plan(void* plan_) {
     VkFftPlan* p = (VkFftPlan*)plan_;
     if (!p) return;
     deleteVkFFT(&p->app_r2c);
@@ -97,7 +101,7 @@ void vkfft_destroy_plan(void* plan_) {
     free(p);
 }
 
-void vkfft_exec_forward_r2c(void* plan_, void* real_in_dev, void* complex_out_dev) {
+void exec_forward_r2c(void* plan_, void* real_in_dev, void* complex_out_dev) {
     VkFftPlan* p = (VkFftPlan*)plan_;
     CUdeviceptr in  = (CUdeviceptr)real_in_dev;
     CUdeviceptr out = (CUdeviceptr)complex_out_dev;
@@ -107,7 +111,7 @@ void vkfft_exec_forward_r2c(void* plan_, void* real_in_dev, void* complex_out_de
     VkFFTAppend(&p->app_r2c, -1, &lp); // forward
 }
 
-void vkfft_exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_dev) {
+void exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_dev) {
     VkFftPlan* p = (VkFftPlan*)plan_;
     CUdeviceptr in  = (CUdeviceptr)complex_in_dev;
     CUdeviceptr out = (CUdeviceptr)real_out_dev;
@@ -116,6 +120,32 @@ void vkfft_exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_de
     lp.outputBuffer = (void**)&out;
     VkFFTAppend(&p->app_c2r, 1, &lp); // inverse
 }
+
+// to replace the individual one?
+void exec_inverse_ExEyEz_c2r(void* plan_, void* exk, void* eyk, void* ezk,
+                              void* ex,  void* ey,  void* ez)
+{
+    VkFftPlan* p = (VkFftPlan*)plan_;
+
+    CUdeviceptr in0 = (CUdeviceptr)exk;
+    CUdeviceptr in1 = (CUdeviceptr)eyk;
+    CUdeviceptr in2 = (CUdeviceptr)ezk;
+
+    CUdeviceptr out0 = (CUdeviceptr)ex;
+    CUdeviceptr out1 = (CUdeviceptr)ey;
+    CUdeviceptr out2 = (CUdeviceptr)ez;
+
+    void* in_arr[3]  = { &in0,  &in1,  &in2  };
+    void* out_arr[3] = { &out0, &out1, &out2 };
+
+    VkFFTLaunchParams lp; memset(&lp, 0, sizeof(lp));
+    lp.buffer        = (void**)in_arr;
+    lp.outputBuffer  = (void**)out_arr;
+    lp.numberBuffers = 3;
+
+    VkFFTAppend(&p->app_c2r, 1, &lp);
+}
+
 
 /* ----- NEW: define the two vk_* k-space symbols so Rust can link ----- */
 

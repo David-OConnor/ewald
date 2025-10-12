@@ -45,21 +45,32 @@ impl VkContext {
 // #[link(name = "vk_fft")] // built from vk_fft.c via build.rs
 unsafe extern "C" {
     // plan lifecycle
-    pub fn vkfft_make_plan_r2c_c2r_many(ctx: *mut c_void, nx: i32, ny: i32, nz: i32) -> *mut c_void;
-    pub fn vkfft_destroy_plan(plan: *mut c_void);
+    pub fn make_plan_r2c_c2r_many(ctx: *mut c_void, nx: i32, ny: i32, nz: i32) -> *mut c_void;
+    pub fn destroy_plan(plan: *mut c_void);
 
     // FFT executions
-    pub fn vkfft_exec_forward_r2c(
+    pub fn exec_forward_r2c(
         plan: *mut c_void,
         real_in_dev: *mut c_void,
         complex_out_dev: *mut c_void,
     );
 
-    pub fn vkfft_exec_inverse_c2r(
+    pub fn exec_inverse_c2r(
         plan: *mut c_void,
         complex_in_dev: *mut c_void,
         real_out_dev: *mut c_void,
     );
+
+    pub fn exec_inverse_ExEyEz_c2r(
+        plan: *mut c_void,
+        exk: *mut c_void,
+        eyk: *mut c_void,
+        ezk: *mut c_void,
+        ex: *mut c_void,
+        ey: *mut c_void,
+        ez: *mut c_void,
+    );
+
 
     // SPME kernels on k-grid (compute shaders)
     pub fn vk_apply_ghat_and_grad(
@@ -187,7 +198,7 @@ impl PmeRecip {
 
         // Forward FFT on GPU: real -> half complex
         unsafe {
-            vkfft_exec_forward_r2c(
+            exec_forward_r2c(
                 self.planner_gpu,
                 dev_ptr_mut(&rho_real_d, stream),
                 dev_ptr_mut(&rho_k_d, stream),
@@ -219,9 +230,20 @@ impl PmeRecip {
         unsafe {
             // todo: Make the vk plan many?
             // if your vk plan is "many", add a wrapper; else call 3x:
-            vkfft_exec_inverse_c2r(self.planner_gpu, exk_ptr, ex_ptr);
-            vkfft_exec_inverse_c2r(self.planner_gpu, eyk_ptr, ey_ptr);
-            vkfft_exec_inverse_c2r(self.planner_gpu, ezk_ptr, ez_ptr);
+            // exec_inverse_c2r(self.planner_gpu, exk_ptr, ex_ptr);
+            // exec_inverse_c2r(self.planner_gpu, eyk_ptr, ey_ptr);
+            // exec_inverse_c2r(self.planner_gpu, ezk_ptr, ez_ptr);
+
+            // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
+            exec_inverse_ExEyEz_c2r(
+                self.planner_gpu,
+                exk_ptr,
+                eyk_ptr,
+                ezk_ptr,
+                ex_ptr,
+                ey_ptr,
+                ez_ptr,
+            );
 
             // same scaling kernel as cuFFT
             scale_ExEyEz_after_c2r(
@@ -295,5 +317,5 @@ impl PmeRecip {
 pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>) -> *mut c_void {
     let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
 
-    unsafe { vkfft_make_plan_r2c_c2r_many(ctx.handle, nx, ny, nz) }
+    unsafe { make_plan_r2c_c2r_many(ctx.handle, nx, ny, nz) }
 }
