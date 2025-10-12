@@ -7,10 +7,9 @@ use crate::{
     PmeRecip, SQRT_PI,
     gpu_shared::{
         GpuTables, dev_ptr, dev_ptr_mut, gather_forces_to_atoms_launch, scale_ExEyEz_after_c2r,
-        scatter_rho_4x4x4_launch,
+        scatter_rho_4x4x4_launch, split3,
     },
 };
-use crate::gpu_shared::split3;
 
 #[repr(C)]
 pub struct VkContext {
@@ -70,7 +69,6 @@ unsafe extern "C" {
         ey: *mut c_void,
         ez: *mut c_void,
     );
-
 
     // SPME kernels on k-grid (compute shaders)
     pub fn vk_apply_ghat_and_grad(
@@ -311,7 +309,6 @@ impl PmeRecip {
         (f, energy)
     }
 }
-
 
 /// Create the GPU plan. Run this at init, or when dimensions change.
 pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>) -> *mut c_void {

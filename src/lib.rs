@@ -13,9 +13,12 @@
 
 extern crate core;
 
-use std::f32::consts::{PI, TAU};
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
+use std::{
+    arch::x86_64::{_CMP_LT_OQ, _mm256_blendv_ps, _mm256_cmp_ps, _mm256_set1_ps},
+    f32::consts::{PI, TAU},
+};
 
 #[cfg(feature = "cufft")]
 mod cufft;
@@ -28,6 +31,8 @@ mod gpu_shared;
 #[cfg(feature = "cufft")]
 use cudarc::driver::DevicePtr;
 use lin_alg::f32::Vec3;
+#[cfg(target_arch = "x86_64")]
+use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
@@ -450,7 +455,8 @@ fn _taper(s: f64) -> (f64, f64) {
     (s_val, ds)
 }
 
-/// We use this for short-range Coulomb forces on the CPU, as part of SPME.
+///  Ideally, use a combined GPU kernel with Lennard Jones, or a SIMD variant, instead of this.
+///  We use this for short-range Coulomb forces on the CPU, as part of SPME.
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
 /// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å.
 ///
@@ -469,7 +475,7 @@ pub fn force_coulomb_short_range(
     α: f32,
 ) -> (Vec3, f32) {
     // Outside the taper region; return 0. (All the force is handled in the long-range region.)
-    if dist > cutoff_dist {
+    if dist >= cutoff_dist {
         return (Vec3::new_zero(), 0.);
     }
 
@@ -487,32 +493,104 @@ pub fn force_coulomb_short_range(
     (dir * force_mag, energy)
 }
 
-// // todo: Update this to reflect your changes to the algo above that apply tapering.
-// pub fn force_coulomb_ewald_real_x8(
-//     dir: Vec3x8,
-//     r: f64x8,
-//     qi: f64x8,
-//     qj: f64x8,
-//     α: f64x8,
-// ) -> Vec3x8 {
-//     // F = q_i q_j [ erfc(αr)/r² + 2α/√π · e^(−α²r²)/r ]  · 4πϵ0⁻¹  · r̂
-//     let qfac = qi * qj;
-//     let inv_r = f64x8::splat(1.) / r;
-//     let inv_r2 = inv_r * inv_r;
-//
-//     // let erfc_term = erfc(alpha * r);
-//     let erfc_term = f64x8::splat(0.); // todo temp: Figure how how to do erfc with SIMD.
-//
-//     // todo: Figure out how to do exp with SIMD. Probably need powf in lin_alg
-//     // let exp_term = (-alpha * alpha * r * r).exp();
-//     // let exp_term = f64x8::splat(E).pow(-alpha * alpha * r * r);
-//     let exp_term = f64x8::splat(1.); // todo temp
-//
-//     let force_mag =
-//         qfac * (erfc_term * inv_r2 + f64x8::splat(2.) * α * exp_term / (f64x8::splat(SQRT_PI) * r));
-//
-//     dir * force_mag
-// }
+#[cfg(target_arch = "x86_64")]
+pub fn force_coulomb_short_range_x8(
+    dir: Vec3x8,
+    dist: f32x8,
+    inv_dist: f32x8,
+    q_0: f32x8,
+    q_1: f32x8,
+    cutoff_dist: f32x8,
+    // Alternatively, we could use a normal f32 for this, and splat it in-fn.
+    α: f32x8,
+) -> (Vec3x8, f32x8) {
+    let α_r = α * dist;
+    let erfc_term = α_r.erfc();
+
+    let charge_term = q_0 * q_1;
+
+    let energy = charge_term * inv_dist * erfc_term;
+
+    let exp_term = (-α_r * α_r).exp();
+
+    let force_mag = charge_term
+        * (erfc_term * inv_dist * inv_dist
+            + f32x8::splat(2.) * α * exp_term * f32x8::splat(INV_SQRT_PI) * inv_dist);
+
+    let force = dir * force_mag;
+
+    // This is where we diverge from the syntax of the non-SIMD variant;
+    // the outside/inside cutoff.
+    // per-lane mask: keep where dist < cutoff_dist, else zero
+    unsafe {
+        let keep = _mm256_cmp_ps::<{ _CMP_LT_OQ }>(dist.0, cutoff_dist.0);
+        let zero = _mm256_set1_ps(0.0);
+
+        let fx = _mm256_blendv_ps(zero, (force.x).0, keep);
+        let fy = _mm256_blendv_ps(zero, (force.y).0, keep);
+        let fz = _mm256_blendv_ps(zero, (force.z).0, keep);
+        let en = _mm256_blendv_ps(zero, energy.0, keep);
+
+        (
+            Vec3x8 {
+                x: f32x8(fx),
+                y: f32x8(fy),
+                z: f32x8(fz),
+            },
+            f32x8(en),
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn force_coulomb_short_range_x16(
+    dir: Vec3x16,
+    dist: f32x16,
+    // Included to share between this and Lennard Jones.
+    inv_dist: f32x16,
+    q_0: f32x16,
+    q_1: f32x16,
+    cutoff_dist: f32x16,
+    // Alternatively, we could use a normal f32 for this, and splat it in-fn.
+    α: f32x16,
+) -> (Vec3x16, f32x16) {
+    let α_r = α * dist;
+    let erfc_term = α_r.erfc();
+
+    let charge_term = q_0 * q_1;
+
+    let energy = charge_term * inv_dist * erfc_term;
+
+    let exp_term = (-α_r * α_r).exp();
+
+    let force_mag = charge_term
+        * (erfc_term * inv_dist * inv_dist
+            + f32x16::splat(2.) * α * exp_term * f32x16::splat(INV_SQRT_PI) * inv_dist);
+
+    let force = dir * force_mag;
+
+    // This is where we diverge from the syntax of the non-SIMD variant;
+    // the outside/inside cutoff.
+    // per-lane mask: keep where dist < cutoff_dist, else zero
+    unsafe {
+        use core::arch::x86_64::*;
+        let keep: __mmask16 = _mm512_cmp_ps_mask::<{ _CMP_LT_OQ }>(dist.0, cutoff_dist.0);
+
+        let fx = _mm512_maskz_mov_ps(keep, (force.x).0);
+        let fy = _mm512_maskz_mov_ps(keep, (force.y).0);
+        let fz = _mm512_maskz_mov_ps(keep, (force.z).0);
+        let en = _mm512_maskz_mov_ps(keep, energy.0);
+
+        (
+            Vec3x16 {
+                x: f32x16(fx),
+                y: f32x16(fy),
+                z: f32x16(fz),
+            },
+            f32x16(en),
+        )
+    }
+}
 
 /// Useful for scaling corrections, e.g. 1-4 exclusions in AMBER.
 pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3 {

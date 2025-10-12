@@ -14,10 +14,9 @@ use crate::{
     PmeRecip,
     gpu_shared::{
         GpuTables, dev_ptr, dev_ptr_mut, gather_forces_to_atoms_launch, scale_ExEyEz_after_c2r,
-        scatter_rho_4x4x4_launch,
+        scatter_rho_4x4x4_launch, split3,
     },
 };
-use crate::gpu_shared::split3;
 
 unsafe extern "C" {
     pub(crate) fn make_plan_r2c_c2r_many(
