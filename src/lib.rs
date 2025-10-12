@@ -32,6 +32,7 @@ use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
+#[cfg(feature = "cuda")]
 use crate::gpu_shared::GpuTables;
 
 const SQRT_PI: f32 = 1.7724538509055159;
