@@ -5,11 +5,10 @@ use std::{ffi::c_void, sync::Arc};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::PmeRecip;
-
-#[cfg(feature = "vkfft")]
-use crate::vk_fft::vkfft_destroy_plan;
 #[cfg(feature = "cufft")]
 use crate::cufft::spme_destroy_plan_r2c_c2r_many;
+#[cfg(feature = "vkfft")]
+use crate::vk_fft::vkfft_destroy_plan;
 
 pub(crate) struct GpuTables {
     pub kx: CudaSlice<f32>,
@@ -105,4 +104,18 @@ pub(crate) fn dev_ptr_mut<T>(buf: &CudaSlice<T>, stream: &Arc<CudaStream>) -> *m
     p as *mut c_void
 }
 
+pub(crate) fn split3(
+    buf: &CudaSlice<f32>,
+    len: usize,
+    stream: &Arc<CudaStream>,
+) -> (*mut c_void, *mut c_void, *mut c_void) {
+    let (base, _) = buf.device_ptr(stream);
+    let base = base as usize;
 
+    let stride = len * size_of::<f32>();
+    (
+        base as *mut c_void,
+        (base + stride) as *mut c_void,
+        (base + 2 * stride) as *mut c_void,
+    )
+}

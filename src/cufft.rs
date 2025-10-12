@@ -14,9 +14,10 @@ use crate::{
     PmeRecip,
     gpu_shared::{
         GpuTables, dev_ptr, dev_ptr_mut, gather_forces_to_atoms_launch, scale_ExEyEz_after_c2r,
+        scatter_rho_4x4x4_launch,
     },
 };
-use crate::gpu_shared::scatter_rho_4x4x4_launch;
+use crate::gpu_shared::split3;
 
 unsafe extern "C" {
     pub(crate) fn spme_make_plan_r2c_c2r_many(
@@ -103,34 +104,21 @@ impl PmeRecip {
 
         let cu_stream = stream.cu_stream() as *mut c_void;
         let tables = self.gpu_tables.as_ref().unwrap();
-        let f32_size = size_of::<f32>();
 
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
         let n_real = nx * ny * nz;
-        let n_cmplx = nx * ny * (nz / 2 + 1); // half-spectrum length
-        let complex_len = n_cmplx * 2; // (re,im) interleaved
+        let n_cplx = nx * ny * (nz / 2 + 1); // half-spectrum length
+        let complex_len = n_cplx * 2; // (re,im) interleaved
 
         // Contiguous real buffer: [ex | ey | ez]
         let ex_ey_ez_d: CudaSlice<f32> = stream.alloc_zeros(3 * n_real).unwrap();
-        let (base_r_ptr, _) = ex_ey_ez_d.device_ptr(stream);
-        let base_r = base_r_ptr as usize;
-        let stride_r_bytes = n_real * f32_size;
-
-        let ex_ptr = base_r as *mut c_void;
-        let ey_ptr = (base_r + stride_r_bytes) as *mut c_void;
-        let ez_ptr = (base_r + 2 * stride_r_bytes) as *mut c_void;
-
         // Contiguous complex buffer: [exk | eyk | ezk]
         let exeyezk_d: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
-        let (base_ptr, _) = exeyezk_d.device_ptr(stream);
-        let base = base_ptr as usize;
-        let stride_bytes = complex_len * f32_size;
 
-        let exk_ptr = base as *mut c_void;
-        let eyk_ptr = (base + stride_bytes) as *mut c_void;
-        let ezk_ptr = (base + 2 * stride_bytes) as *mut c_void;
+        let (ex_ptr, ey_ptr, ez_ptr) = split3(&ex_ey_ez_d, n_real, stream);
+        let (exk_ptr, eyk_ptr, ezk_ptr) = split3(&exeyezk_d, complex_len, stream);
 
         let kx_ptr = dev_ptr(&tables.kx, stream);
         let ky_ptr = dev_ptr(&tables.ky, stream);
@@ -239,7 +227,7 @@ impl PmeRecip {
         // Energy (half spectrum)
         let n_threads = 256;
         let blocks = {
-            let n = n_cmplx as i32;
+            let n = n_cplx as i32;
             (n + n_threads - 1) / n_threads
         };
         let partial_d: CudaSlice<f64> = stream.alloc_zeros(blocks as usize).unwrap();

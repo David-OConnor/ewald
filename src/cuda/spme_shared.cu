@@ -61,6 +61,22 @@ void scatter_rho_4x4x4(
     }
 }
 
+extern "C"
+void scatter_rho_4x4x4_launch(
+    const void* pos, const void* q, void* rho,
+    int n_atoms, int nx, int ny, int nz,
+    float lx, float ly, float lz, void* cu_stream)
+{
+    auto s = reinterpret_cast<cudaStream_t>(cu_stream);
+    int threads = 256;
+    int blocks  = (n_atoms + threads - 1) / threads;
+    scatter_rho_4x4x4<<<blocks, threads, 0, s>>>(
+        static_cast<const float3*>(pos),
+        static_cast<const float*>(q),
+        static_cast<float*>(rho),
+        n_atoms, nx, ny, nz, lx, ly, lz);
+}
+
 
 // todo: Does this need a __device__ tag?
 extern "C"

@@ -1,101 +1,70 @@
+// vk_fft.c
 #include <stdlib.h>
 #include <string.h>
-#include <cuda.h> // Driver API only
-#include "vkFFT.h"
+#include <cuda.h>      // Driver API
+#include "vkFFT.h"     // third-party library header (VkFFTApplication, etc.)
+#include "vk_fft.h"    // your FFI header (prototypes above)
 
-// ---- tiny CUDA ctx/stream + plan (Driver API only) ----
 typedef struct {
     CUdevice  dev;
     CUcontext ctx;
     CUstream  stream;
-    int owns_stream; // 0 = adopted (do not destroy), 1 = we created it
+    int owns_stream; // 0 = adopted, 1 = created
 } VkContext;
 
 typedef struct {
-    VkFFTApplication app_r2c;
-    VkFFTApplication app_c2r;
+    VkFFTApplication   app_r2c;
+    VkFFTApplication   app_c2r;
     VkFFTConfiguration cfg_r2c;
     VkFFTConfiguration cfg_c2r;
     uint64_t Nx, Ny, Nz;
 } VkFftPlan;
 
-typedef struct { CUdeviceptr ptr; size_t size; } VkBuf;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 void* vk_make_context_from_stream(void* cu_stream_void) {
     VkContext* c = (VkContext*)calloc(1, sizeof(VkContext));
     c->stream = (CUstream)cu_stream_void;
     c->owns_stream = 0;
 
-    // Ensure Driver API initialized & grab current ctx/dev
     cuInit(0);
     CUcontext cur = NULL;
     cuCtxGetCurrent(&cur);
     if (cur == NULL) {
-        // If no current context, try to retain primary on device 0 and set it current.
         CUdevice dev0; cuDeviceGet(&dev0, 0);
         cuDevicePrimaryCtxRetain(&cur, dev0);
         cuCtxSetCurrent(cur);
     }
     c->ctx = cur;
-
-    CUdevice dev;
-    cuCtxGetDevice(&dev);
-    c->dev = dev;
-
+    cuCtxGetDevice(&c->dev);
     return c;
 }
 
-// ---- utils ----
-static VkContext* make_default_ctx(void) {
+void* vk_make_context_default(void) {
     VkContext* c = (VkContext*)calloc(1, sizeof(VkContext));
     cuInit(0);
     cuDeviceGet(&c->dev, 0);
-
     CUcontext primary = NULL;
     cuDevicePrimaryCtxRetain(&primary, c->dev);
     cuCtxSetCurrent(primary);
     c->ctx = primary;
-
     cuStreamCreate(&c->stream, CU_STREAM_DEFAULT);
     c->owns_stream = 1;
     return c;
 }
 
-static void destroy_ctx(VkContext* c) {
+void vk_destroy_context(void* ctx_) {
+    VkContext* c = (VkContext*)ctx_;
     if (!c) return;
     if (c->owns_stream) cuStreamDestroy(c->stream);
-    // If we retained the primary context in make_default_ctx, release it:
     if (c->owns_stream) cuDevicePrimaryCtxRelease(c->dev);
     free(c);
 }
 
-static VkBuf* alloc_host_visible(VkContext* c, size_t nbytes, int zero) {
-    (void)c;
-    VkBuf* b = (VkBuf*)calloc(1, sizeof(VkBuf));
-    cuMemAlloc(&b->ptr, nbytes);
-    b->size = nbytes;
-    if (zero && nbytes) cuMemsetD8(b->ptr, 0, nbytes);
-    return b;
-}
-
-static void free_buf(VkContext* c, VkBuf* b) {
-    (void)c; if (!b) return; if (b->ptr) cuMemFree(b->ptr); free(b);
-}
-
-static void upload(VkContext* c, VkBuf* b, const void* src, size_t n) {
-    (void)c; if (n) cuMemcpyHtoD(b->ptr, src, n);
-}
-
-static void download(VkContext* c, VkBuf* b, void* dst, size_t n) {
-    (void)c; if (n) cuMemcpyDtoH(dst, b->ptr, n);
-}
-
-// ---- FFI exports ----
-void* vk_make_context_default(void) { return make_default_ctx(); }
-void vk_destroy_context(void* ctx) { destroy_ctx((VkContext*)ctx); }
-
-void* vkfft_make_plan_r2c_c2r_many(void* ctx, int32_t nx, int32_t ny, int32_t nz) {
-    VkContext* c = (VkContext*)ctx;
+void* vkfft_make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
+    VkContext* c = (VkContext*)ctx_;
     VkFftPlan* p = (VkFftPlan*)calloc(1, sizeof(VkFftPlan));
     p->Nx = (uint64_t)nx; p->Ny = (uint64_t)ny; p->Nz = (uint64_t)nz;
 
@@ -130,26 +99,58 @@ void vkfft_destroy_plan(void* plan_) {
 
 void vkfft_exec_forward_r2c(void* plan_, void* real_in_dev, void* complex_out_dev) {
     VkFftPlan* p = (VkFftPlan*)plan_;
-    VkBuf* rin = (VkBuf*)real_in_dev;
-    VkBuf* kout = (VkBuf*)complex_out_dev;
-
-    VkFFTLaunchParams lp;
-    memset(&lp, 0, sizeof(lp));
-    lp.buffer       = (void**)&rin->ptr;   // sizes not required
-    lp.outputBuffer = (void**)&kout->ptr;
-
+    CUdeviceptr in  = (CUdeviceptr)real_in_dev;
+    CUdeviceptr out = (CUdeviceptr)complex_out_dev;
+    VkFFTLaunchParams lp; memset(&lp, 0, sizeof(lp));
+    lp.buffer       = (void**)&in;
+    lp.outputBuffer = (void**)&out;
     VkFFTAppend(&p->app_r2c, -1, &lp); // forward
 }
 
 void vkfft_exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_dev) {
     VkFftPlan* p = (VkFftPlan*)plan_;
-    VkBuf* kin = (VkBuf*)complex_in_dev;
-    VkBuf* rout = (VkBuf*)real_out_dev;
-
-    VkFFTLaunchParams lp;
-    memset(&lp, 0, sizeof(lp));
-    lp.buffer       = (void**)&kin->ptr;
-    lp.outputBuffer = (void**)&rout->ptr;
-
+    CUdeviceptr in  = (CUdeviceptr)complex_in_dev;
+    CUdeviceptr out = (CUdeviceptr)real_out_dev;
+    VkFFTLaunchParams lp; memset(&lp, 0, sizeof(lp));
+    lp.buffer       = (void**)&in;
+    lp.outputBuffer = (void**)&out;
     VkFFTAppend(&p->app_c2r, 1, &lp); // inverse
 }
+
+/* ----- NEW: define the two vk_* k-space symbols so Rust can link ----- */
+
+void vk_apply_ghat_and_grad(
+    void* ctx_,
+    const void* rho_k,
+    void* exk, void* eyk, void* ezk,
+    const void* kx, const void* ky, const void* kz,
+    const void* bx, const void* by, const void* bz,
+    int32_t nx, int32_t ny, int32_t nz, float vol, float alpha)
+{
+    (void)vol; (void)alpha;
+    VkContext* c = (VkContext*)ctx_;
+    // You can call a CUDA kernel here (in a .cu TU) using c->stream,
+    // or temporarily memset outputs to zero as a stub:
+    cuMemsetD8((CUdeviceptr)exk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
+    cuMemsetD8((CUdeviceptr)eyk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
+    cuMemsetD8((CUdeviceptr)ezk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
+    (void)rho_k; (void)kx; (void)ky; (void)kz; (void)bx; (void)by; (void)bz;
+    (void)c;
+}
+
+double vk_energy_half_spectrum_sum(
+    void* ctx_,
+    const void* rho_k,
+    const void* kx, const void* ky, const void* kz,
+    const void* bx, const void* by, const void* bz,
+    int32_t nx, int32_t ny, int32_t nz, float vol, float alpha)
+{
+    (void)ctx_; (void)rho_k; (void)kx; (void)ky; (void)kz; (void)bx; (void)by; (void)bz;
+    (void)nx; (void)ny; (void)nz; (void)vol; (void)alpha;
+    // Replace with a CUDA reduction kernel; stub returns 0 to link:
+    return 0.0;
+}
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
