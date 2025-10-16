@@ -12,28 +12,28 @@ fn main() {
     build_host(
         // Select the min supported GPU architecture.
         GpuArchitecture::Rtx3,
-        &["src/cuda/spme_cufft.cu", "src/cuda/spme_shared.cu"],
+        &["src/cuda/spme_cufft.cu", "src/cuda/shared.cu"],
         "spme",
     );
 
     #[cfg(feature = "vkfft")]
     {
-        build_host(GpuArchitecture::Rtx3, &["src/cuda/spme_shared.cu"], "spme");
+        build_host(GpuArchitecture::Rtx3, &["src/cuda/shared.cu"], "spme");
 
-        println!("cargo:rerun-if-changed=src/vk_fft.c");
-        println!("cargo:rerun-if-changed=src/vk_fft.h");
+        println!("cargo:rerun-if-changed=src/cuda/vk_fft.cu");
+        println!("cargo:rerun-if-changed=src/cuda/vk_fft.h");
         // This is the vkFFT header
         println!("cargo:rerun-if-changed=third_party/VkFFT/vkFFT.h");
 
         cc::Build::new()
             .cuda(true)
-            .files(["src/vk_fft.c"])
+            .files(["src/cuda/vk_fft.cu"])
             .define("VKFFT_BACKEND", Some("1")) //  Sets the backend to CUDA
-            .define("_CRT_SECURE_NO_WARNINGS", None)
+            // .define("_CRT_SECURE_NO_WARNINGS", None)
             .include("src")
             .include("third_party/VkFFT/vkFFT")
             .flag_if_supported("-O3")
-            .warnings(false)
+            // .warnings(false)
             .compile("vk_fft");
     }
 }

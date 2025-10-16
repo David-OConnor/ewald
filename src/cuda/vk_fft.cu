@@ -79,15 +79,22 @@ void* make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
     p->cfg_r2c.performR2C  = 1;
 
     memset(&p->cfg_c2r, 0, sizeof(p->cfg_c2r));
-    p->cfg_c2r.FFTdim = 3;
-    p->cfg_c2r.size[0] = p->Nx; p->cfg_c2r.size[1] = p->Ny; p->cfg_c2r.size[2] = p->Nz;
-    p->cfg_c2r.device      = &c->dev;
-    p->cfg_c2r.stream      = &c->stream;
+    p->cfg_c2r = (VkFFTConfiguration){0};
+    p->cfg_c2r.FFTdim = 4;
+    p->cfg_c2r.size[0] = 3;               // batch: Ex,Ey,Ez
+    p->cfg_c2r.size[1] = p->Nx;
+    p->cfg_c2r.size[2] = p->Ny;
+    p->cfg_c2r.size[3] = p->Nz;
+    p->cfg_c2r.omitDimension[0] = 1;      // no FFT over batch
+    p->cfg_c2r.performR2C = 0;
+    p->cfg_c2r.device = &c->dev;
+    p->cfg_c2r.stream = &c->stream;
     p->cfg_c2r.num_streams = 1;
-    p->cfg_c2r.performR2C  = 0;
+    VKFFT_CHECK(initializeVkFFT(&p->app_c2r, p->cfg_c2r));
 
     if (initializeVkFFT(&p->app_r2c, p->cfg_r2c) != VKFFT_SUCCESS) { free(p); return NULL; }
     if (initializeVkFFT(&p->app_c2r, p->cfg_c2r) != VKFFT_SUCCESS) { deleteVkFFT(&p->app_r2c); free(p); return NULL; }
+
     return p;
 }
 
@@ -120,63 +127,29 @@ void exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_dev) {
 }
 
 // to replace the individual one?
-void exec_inverse_ExEyEz_c2r(void* plan_, void* exk, void* eyk, void* ezk,
-                              void* ex,  void* ey,  void* ez)
-{
+// void exec_inverse_ExEyEz_c2r(
+//     void* plan_,
+//     void* exk,
+//     void* eyk,
+//     void* ezk,
+//     void* ex,
+//     void* ey,
+//     void* ez
+
+extern "C" void exec_inverse_ExEyEz_c2r(void* plan_,
+                                        void* exeyezk_base, void*, void*,
+                                        void* ex_ey_ez_base, void*, void*)
+) {
+//     exec_inverse_c2r(plan_, exk, ex);
+//     exec_inverse_c2r(plan_, eyk, ey);
+//     exec_inverse_c2r(plan_, ezk, ez);
     VkFftPlan* p = (VkFftPlan*)plan_;
-
-    CUdeviceptr in0 = (CUdeviceptr)exk;
-    CUdeviceptr in1 = (CUdeviceptr)eyk;
-    CUdeviceptr in2 = (CUdeviceptr)ezk;
-
-    CUdeviceptr out0 = (CUdeviceptr)ex;
-    CUdeviceptr out1 = (CUdeviceptr)ey;
-    CUdeviceptr out2 = (CUdeviceptr)ez;
-
-    void* in_arr[3]  = { &in0,  &in1,  &in2  };
-    void* out_arr[3] = { &out0, &out1, &out2 };
-
-    VkFFTLaunchParams lp; memset(&lp, 0, sizeof(lp));
-    lp.buffer        = (void**)in_arr;
-    lp.outputBuffer  = (void**)out_arr;
-    lp.numberBuffers = 3;
-
-    VkFFTAppend(&p->app_c2r, 1, &lp);
-}
-
-
-/* ----- NEW: define the two vk_* k-space symbols so Rust can link ----- */
-
-void vk_apply_ghat_and_grad(
-    void* ctx_,
-    const void* rho_k,
-    void* exk, void* eyk, void* ezk,
-    const void* kx, const void* ky, const void* kz,
-    const void* bx, const void* by, const void* bz,
-    int32_t nx, int32_t ny, int32_t nz, float vol, float alpha)
-{
-    (void)vol; (void)alpha;
-    VkContext* c = (VkContext*)ctx_;
-    // You can call a CUDA kernel here (in a .cu TU) using c->stream,
-    // or temporarily memset outputs to zero as a stub:
-    cuMemsetD8((CUdeviceptr)exk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
-    cuMemsetD8((CUdeviceptr)eyk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
-    cuMemsetD8((CUdeviceptr)ezk, 0, (size_t)nx*ny*(nz/2+1)*2*sizeof(float));
-    (void)rho_k; (void)kx; (void)ky; (void)kz; (void)bx; (void)by; (void)bz;
-    (void)c;
-}
-
-double vk_energy_half_spectrum_sum(
-    void* ctx_,
-    const void* rho_k,
-    const void* kx, const void* ky, const void* kz,
-    const void* bx, const void* by, const void* bz,
-    int32_t nx, int32_t ny, int32_t nz, float vol, float alpha)
-{
-    (void)ctx_; (void)rho_k; (void)kx; (void)ky; (void)kz; (void)bx; (void)by; (void)bz;
-    (void)nx; (void)ny; (void)nz; (void)vol; (void)alpha;
-    // Replace with a CUDA reduction kernel; stub returns 0 to link:
-    return 0.0;
+    CUdeviceptr in  = (CUdeviceptr)exeyezk_base;   // [exk|eyk|ezk]
+    CUdeviceptr out = (CUdeviceptr)ex_ey_ez_base;  // [ex|ey|ez]
+    VkFFTLaunchParams lp = {};
+    lp.buffer       = (void**)&in;
+    lp.outputBuffer = (void**)&out;
+    VkFFTAppend(&p->app_c2r, /*inverse*/ 1, &lp);
 }
 
 #ifdef __cplusplus

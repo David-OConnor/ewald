@@ -25,6 +25,7 @@ mod cufft;
 #[cfg(feature = "vkfft")]
 pub mod vk_fft;
 
+mod ffi_shared;
 #[cfg(feature = "cuda")]
 mod gpu_shared;
 
