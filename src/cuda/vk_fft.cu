@@ -73,24 +73,19 @@ void* make_plan_r2c_c2r_many(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
     memset(&p->cfg_r2c, 0, sizeof(p->cfg_r2c));
     p->cfg_r2c.FFTdim = 3;
     p->cfg_r2c.size[0] = p->Nx; p->cfg_r2c.size[1] = p->Ny; p->cfg_r2c.size[2] = p->Nz;
-    p->cfg_r2c.device      = &c->dev;
-    p->cfg_r2c.stream      = &c->stream;
-    p->cfg_r2c.num_streams = 1;
-    p->cfg_r2c.performR2C  = 1;
+    p->cfg_r2c.device = &c->dev; p->cfg_r2c.stream = &c->stream;
+    p->cfg_r2c.num_streams = 1; p->cfg_r2c.performR2C = 1;
 
     memset(&p->cfg_c2r, 0, sizeof(p->cfg_c2r));
-    p->cfg_c2r = (VkFFTConfiguration){0};
     p->cfg_c2r.FFTdim = 4;
-    p->cfg_c2r.size[0] = 3;               // batch: Ex,Ey,Ez
+    p->cfg_c2r.size[0] = 3;                 // batch axis: Ex,Ey,Ez
     p->cfg_c2r.size[1] = p->Nx;
     p->cfg_c2r.size[2] = p->Ny;
     p->cfg_c2r.size[3] = p->Nz;
-    p->cfg_c2r.omitDimension[0] = 1;      // no FFT over batch
+    p->cfg_c2r.omitDimension[0] = 1;        // do not FFT over batch
     p->cfg_c2r.performR2C = 0;
-    p->cfg_c2r.device = &c->dev;
-    p->cfg_c2r.stream = &c->stream;
+    p->cfg_c2r.device = &c->dev; p->cfg_c2r.stream = &c->stream;
     p->cfg_c2r.num_streams = 1;
-    VKFFT_CHECK(initializeVkFFT(&p->app_c2r, p->cfg_c2r));
 
     if (initializeVkFFT(&p->app_r2c, p->cfg_r2c) != VKFFT_SUCCESS) { free(p); return NULL; }
     if (initializeVkFFT(&p->app_c2r, p->cfg_c2r) != VKFFT_SUCCESS) { deleteVkFFT(&p->app_r2c); free(p); return NULL; }
@@ -126,19 +121,11 @@ void exec_inverse_c2r(void* plan_, void* complex_in_dev, void* real_out_dev) {
     VkFFTAppend(&p->app_c2r, 1, &lp); // inverse
 }
 
-// to replace the individual one?
-// void exec_inverse_ExEyEz_c2r(
-//     void* plan_,
-//     void* exk,
-//     void* eyk,
-//     void* ezk,
-//     void* ex,
-//     void* ey,
-//     void* ez
 
-extern "C" void exec_inverse_ExEyEz_c2r(void* plan_,
-                                        void* exeyezk_base, void*, void*,
-                                        void* ex_ey_ez_base, void*, void*)
+extern "C" void exec_inverse_ExEyEz_c2r(
+    void* plan_,
+    void* exeyezk_base, void*, void*,
+    void* ex_ey_ez_base, void*, void*
 ) {
 //     exec_inverse_c2r(plan_, exk, ex);
 //     exec_inverse_c2r(plan_, eyk, ey);

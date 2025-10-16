@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 
-// #include "shared.cu"
+#include "shared.cu"
 
 
 // A minimal CUFFT error checker.
