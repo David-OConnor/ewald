@@ -7,8 +7,6 @@
 #include "vkFFT.h"     // third-party library header (VkFFTApplication, etc.)
 #include "vk_fft.h"    // your FFI header (prototypes above)
 
-
-
 typedef struct {
     CUdevice  dev;
     CUcontext ctx;

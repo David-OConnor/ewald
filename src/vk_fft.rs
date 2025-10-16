@@ -11,6 +11,32 @@ use crate::{
     },
 };
 
+unsafe extern "C" {
+    fn vk_make_context_default() -> *mut core::ffi::c_void;
+    fn vk_destroy_context(ctx: *mut core::ffi::c_void);
+}
+
+// tiny RAII so we don’t leak the driver primary context/stream
+pub struct VkCtx(Arc<VkContext>);
+
+impl Default for VkCtx {
+    fn default() -> Self {
+        // This is just a placeholder; override it with the Cudarc stream.
+        let handle = unsafe { vk_make_context_default() };
+        assert!(!handle.is_null());
+        VkCtx(Arc::new(VkContext { handle }))
+    }
+}
+
+impl Drop for VkCtx {
+    fn drop(&mut self) {
+        // only when last Arc drops — ok for a demo
+        if Arc::strong_count(&self.0) == 1 {
+            unsafe { vk_destroy_context(self.0.handle) };
+        }
+    }
+}
+
 #[repr(C)]
 pub struct VkContext {
     pub handle: *mut c_void,
