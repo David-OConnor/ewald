@@ -22,7 +22,8 @@ The API is split into two main parts: A standalone function to calculate short-r
 a struct with forces method for long-range reciprical forces.
 
 Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable 
-the `cuda` feature in `Cargo.toml`.
+either the `cufft` or `vkfft`  feature in `Cargo.toml`. We use these GPU FFT libraries to compute. Note that they both
+use the Cuda driver internally; VKFFT is configured with a Cuda backend.
 
 Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).

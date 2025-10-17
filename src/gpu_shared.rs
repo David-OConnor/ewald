@@ -167,7 +167,9 @@ impl PmeRecip {
 
         // Gather forces F = q * E
         let f_d: CudaSlice<f32> = stream.alloc_zeros(pos.len() * 3).unwrap();
-        let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
+        // let inv_n = 1.0f32 / (nx as f32 * ny as f32 * nz as f32);
+        // Scaled already on the GPU.
+        let inv_n = 1.0f32;
 
         unsafe {
             gather_forces_to_atoms_launch(

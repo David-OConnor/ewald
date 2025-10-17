@@ -3,7 +3,6 @@
 #![allow(confusable_idents)]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::excessive_precision)]
-// #![feature(core_float_math)] When stable
 
 //! For Smooth-Particle-Mesh Ewald; a standard approximation for Coulomb forces in MD.
 //! We use this to handle periodic boundary conditions (e.g. of the solvent) properly.
@@ -264,6 +263,8 @@ impl PmeRecip {
                             let w = (wxy * wz[c]) as f64;
                             let idx = iz * (nx * ny) + iy * nx + ix;
 
+                            // println!("V: {:?}", exk[idx]);
+
                             ex = w.mul_add(exk[idx].re as f64, ex);
                             ey = w.mul_add(eyk[idx].re as f64, ey);
                             ez = w.mul_add(ezk[idx].re as f64, ez);
@@ -431,14 +432,16 @@ fn fft3_inplace(
 
     // rustfft inverse is unnormalized; many MD codes keep that and balance elsewhere.
     // If you prefer normalized inverse, scale here by 1/(nx*ny*nz) after inverse passes.
-    if !forward {
-        let len = nx * ny * nz;
-        let scale = 1.0 / (len as f32);
-        for v in data.iter_mut() {
-            v.re *= scale;
-            v.im *= scale;
-        }
-    }
+
+    // todo: I think we must remove this?
+    // if !forward {
+    //     let len = nx * ny * nz;
+    //     let scale = 1.0 / (len as f32);
+    //     for v in data.iter_mut() {
+    //         v.re *= scale;
+    //         v.im *= scale;
+    //     }
+    // }
 }
 
 /// We use this to smoothly switch between short-range and long-range (reciprical) forces.
@@ -468,7 +471,7 @@ fn _taper(s: f64) -> (f64, f64) {
 pub fn force_coulomb_short_range(
     dir: Vec3,
     dist: f32,
-    // Included to share between this and Lennard Jones.
+    // Included in this form to share between this and Lennard Jones.
     inv_dist: f32,
     q_0: f32,
     q_1: f32,
@@ -601,7 +604,6 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
     let inv_r2 = inv_r * inv_r;
 
     let ar = alpha * r;
-    // todo: Mul_add when it's stable.
     let fmag = qfac
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
