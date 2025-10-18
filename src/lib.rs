@@ -24,7 +24,6 @@ mod cufft;
 #[cfg(feature = "vkfft")]
 pub mod vk_fft;
 
-mod ffi_shared;
 #[cfg(feature = "cuda")]
 mod gpu_shared;
 
@@ -39,6 +38,9 @@ use statrs::function::erf::{erf, erfc};
 
 #[cfg(feature = "cuda")]
 use crate::gpu_shared::GpuTables;
+
+#[cfg(feature = "cuda")]
+pub const PTX: &str = include_str!("../ewald.ptx");
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -119,8 +121,8 @@ impl PmeRecip {
     /// CPU charge spreading.
     // todo: QC this against the charge spreading you use for GPU.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
-        let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
+        let (lx, ly, lz) = self.box_dims;
 
         let nxny = nx * ny;
 
@@ -212,9 +214,12 @@ impl PmeRecip {
 
                 // E(k) = i k φ(k)
                 // todo: QC if you need to flip the sign here on kxv, kyv. (Rem the -)
-                *ex = Complex::new(0.0, -kxv) * phi_k;
-                *ey = Complex::new(0.0, -kyv) * phi_k;
-                *ez = Complex::new(0.0, -kzv) * phi_k;
+                // *ex = Complex::new(0.0, -kxv) * phi_k;
+                // *ey = Complex::new(0.0, -kyv) * phi_k;
+                // *ez = Complex::new(0.0, -kzv) * phi_k;
+                *ex = Complex::new(0.0, kxv) * phi_k;
+                *ey = Complex::new(0.0, kyv) * phi_k;
+                *ez = Complex::new(0.0, kzv) * phi_k;
 
                 // reciprocal-space energy density: (1/2) Re{ ρ*(k) φ(k) }
                 // 0.5 * (rho[idx].conj() * phi_k).re as f64

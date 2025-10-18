@@ -3,11 +3,19 @@
 #[cfg(feature = "vkfft")]
 use cc;
 #[cfg(feature = "cuda")]
-use cuda_setup::{GpuArchitecture, build_host};
+use cuda_setup::{GpuArchitecture, build_host, build_ptx};
 
 fn main() {
-    // todo: You may need to split the GPU charge spread to a differnet module,
-    // todo: So we are not bringing in the cuFFT requirement for the vkFFT branch.
+    // Build non-FFT kernels that are used for both GPU FFT branches.
+    #[cfg(feature = "cuda")]
+    build_ptx(
+        // Select the min supported GPU architecture.
+        GpuArchitecture::Rtx3,
+        &["src/cuda/shared.cu"],
+        "ewald",
+    );
+
+    // cuFFT-specifical host-side building
     #[cfg(feature = "cufft")]
     build_host(
         // Select the min supported GPU architecture.
@@ -16,6 +24,7 @@ fn main() {
         "spme",
     );
 
+    // VkFFT-specifical host-side building
     #[cfg(feature = "vkfft")]
     {
         build_host(GpuArchitecture::Rtx3, &["src/cuda/shared.cu"], "spme");
