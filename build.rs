@@ -11,7 +11,7 @@ fn main() {
     build_ptx(
         // Select the min supported GPU architecture.
         GpuArchitecture::Rtx3,
-        &["src/cuda/shared.cu"],
+        &["src/cuda/kernels.cu"],
         "ewald",
     );
 
@@ -20,14 +20,14 @@ fn main() {
     build_host(
         // Select the min supported GPU architecture.
         GpuArchitecture::Rtx3,
-        &["src/cuda/spme_cufft.cu", "src/cuda/shared.cu"],
+        &["src/cuda/cufft.cu", "src/cuda/kernels.cu"],
         "spme",
     );
 
     // VkFFT-specifical host-side building
     #[cfg(feature = "vkfft")]
     {
-        build_host(GpuArchitecture::Rtx3, &["src/cuda/shared.cu"], "spme");
+        build_host(GpuArchitecture::Rtx3, &["src/cuda/kernels.cu"], "spme");
 
         println!("cargo:rerun-if-changed=src/cuda/vk_fft.cu");
         println!("cargo:rerun-if-changed=src/cuda/vk_fft.h");

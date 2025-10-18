@@ -9,8 +9,6 @@
 #include <cstdio>
 #include <cstdint>
 
-#include "shared.cu"
-
 
 // A minimal CUFFT error checker.
 #ifndef CUFFT_CHECK

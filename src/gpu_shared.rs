@@ -89,8 +89,12 @@ impl PmeRecip {
         // todo: Can we create this once in the PmeRecip struct, then call it,
         // todo instead of re-allocating each step?
 
-        // todo: Store this eventually
+        // todo: Store these eventually. Not too big of a deal to load here though.
         let kernel_spread = module.load_function("spread_charges").unwrap();
+        let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
+        let kernel_scale = module.load_function("scale_vec").unwrap();
+        let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
+        let kernel_half_spectrum = module.load_function("energy_half_spectrum").unwrap();
 
         // todo: Should we init these once and store, instead of re-allocating at each step?
         // rho_real on device
@@ -122,8 +126,6 @@ impl PmeRecip {
             );
         }
 
-        let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
-
         // todo: Can we maintain these in memory instead of re-allocating each time?
         // Contiguous complex buffer: [exk | eyk | ezk]
         // let ekx_eky_ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
@@ -137,13 +139,13 @@ impl PmeRecip {
         let ekz_ptr = cuda_slice_to_ptr_mut(&ekz_gpu, stream);
 
         // // todo: Pre-allocate these instead of every step?
-        let ex_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let ey_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let ez_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut ex_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut ey_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut ez_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
 
-        let ex_ptr = cuda_slice_to_ptr(&ex_gpu, stream);
-        let ey_ptr = cuda_slice_to_ptr(&ey_gpu, stream);
-        let ez_ptr = cuda_slice_to_ptr(&ez_gpu, stream);
+        let ex_ptr = cuda_slice_to_ptr_mut(&ex_gpu, stream);
+        let ey_ptr = cuda_slice_to_ptr_mut(&ey_gpu, stream);
+        let ez_ptr = cuda_slice_to_ptr_mut(&ez_gpu, stream);
 
         // Apply G(k) and gradient to get Exk/Eyk/Ezk
         apply_ghat_and_grad(
@@ -163,22 +165,24 @@ impl PmeRecip {
             // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
             exec_inverse_ExEyEz_c2r(
                 self.planner_gpu,
-                ekx_ptr as *mut _,
-                eky_ptr as *mut _,
-                ekz_ptr as *mut _,
-                ex_ptr as *mut _,
-                ey_ptr as *mut _,
-                ez_ptr as *mut _,
+                ekx_ptr,
+                eky_ptr,
+                ekz_ptr,
+                ex_ptr,
+                ey_ptr,
+                ez_ptr,
             );
         }
 
-        // Scale by 1/N once here
-        // todo: Implement!
+        let n_real = nx * ny * nz;
+        let inv_n = 1.0f32 / (n_real as f32);
 
-        let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
+        scale_vec(stream, &kernel_scale, &mut ex_gpu, inv_n);
+        scale_vec(stream, &kernel_scale, &mut ey_gpu, inv_n);
+        scale_vec(stream, &kernel_scale, &mut ez_gpu, inv_n);
 
-        // todo: We need to use this somewhere, right?
-        let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(n_cplx).unwrap();
+        let n_atoms = pos.len();
+        let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * n_atoms).unwrap();
 
         gather_forces_to_atoms(
             stream,
@@ -195,7 +199,6 @@ impl PmeRecip {
 
         // todo: Qc this! Not sure what it should be.
         let mut out_partial_gpu: CudaSlice<f64> = stream.alloc_zeros(n_cplx).unwrap();
-        let kernel_half_spectrum = module.load_function("energy_half_spectrum").unwrap();
 
         energy_half_spectrum(
             stream,
@@ -301,20 +304,28 @@ fn spread_charges(
     n_posits: u32,
 ) {
     let (nx, ny, nz) = plan_dims;
+    let nx_i = nx as i32;
+    let ny_i = ny as i32;
+    let nz_i = nz as i32;
+
     let (lx, ly, lz) = box_dims;
 
-    let cfg = LaunchConfig::for_num_elems(n_posits);
+    let n_atoms_i = n_posits as i32;
+
+    let cfg = launch_cfg(n_posits as u32, 256);
+
     let mut launch_args = stream.launch_builder(kernel);
 
     launch_args.arg(pos_gpu);
     launch_args.arg(q_gpu);
     launch_args.arg(rho_real_gpu);
 
-    launch_args.arg(&n_posits);
 
-    launch_args.arg(&nx);
-    launch_args.arg(&ny);
-    launch_args.arg(&nz);
+    launch_args.arg(&n_atoms_i);
+
+    launch_args.arg(&nx_i);
+    launch_args.arg(&ny_i);
+    launch_args.arg(&nz_i);
     launch_args.arg(&lx);
     launch_args.arg(&ly);
     launch_args.arg(&lz);
@@ -336,10 +347,14 @@ fn apply_ghat_and_grad(
     alpha: f32,
 ) {
     let (nx, ny, nz) = plan_dims;
+    let nx_i = nx as i32;
+    let ny_i = ny as i32;
+    let nz_i = nz as i32;
 
     let n = nx * ny * (nz / 2 + 1);
 
-    let cfg = LaunchConfig::for_num_elems(n as u32);
+    // let cfg = LaunchConfig::for_num_elems(n as u32);
+    let cfg = launch_cfg(n as u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
     launch_args.arg(rho_cplx_gpu);
@@ -355,9 +370,9 @@ fn apply_ghat_and_grad(
     launch_args.arg(&tables.by);
     launch_args.arg(&tables.bz);
 
-    launch_args.arg(&nx);
-    launch_args.arg(&ny);
-    launch_args.arg(&nz);
+    launch_args.arg(&nx_i);
+    launch_args.arg(&ny_i);
+    launch_args.arg(&nz_i);
 
     launch_args.arg(&vol);
     launch_args.arg(&alpha);
@@ -377,11 +392,18 @@ fn energy_half_spectrum(
     alpha: f32,
 ) {
     let (nx, ny, nz) = plan_dims;
+    let nx_i = nx as i32;
+    let ny_i = ny as i32;
+    let nz_i = nz as i32;
 
-    // todo: QC if this is the right n! Maybe we want rho_cplx_gpu's len / 2??
-    let n = nx * ny * (nz / 2 + 1);
+    let n = (nx * ny * (nz / 2 + 1)) as i32;
 
-    let cfg = LaunchConfig::for_num_elems(n as u32);
+    let block: u32 = 256;
+    let grid: u32 = ((n as u32) + block - 1) / block;
+
+    // let cfg = LaunchConfig::for_num_elems(n as u32);
+    let cfg = launch_cfg(n as u32, 256);
+
     let mut launch_args = stream.launch_builder(kernel);
 
     launch_args.arg(rho_cplx_gpu);
@@ -394,9 +416,9 @@ fn energy_half_spectrum(
     launch_args.arg(&tables.by);
     launch_args.arg(&tables.bz);
 
-    launch_args.arg(&nx);
-    launch_args.arg(&ny);
-    launch_args.arg(&nz);
+    launch_args.arg(&nx_i);
+    launch_args.arg(&ny_i);
+    launch_args.arg(&nz_i);
 
     launch_args.arg(&vol);
     launch_args.arg(&alpha);
@@ -420,13 +442,20 @@ fn gather_forces_to_atoms(
     box_dims: (f32, f32, f32),
 ) {
     let (nx, ny, nz) = plan_dims;
+    let nx_i = nx as i32;
+    let ny_i = ny as i32;
+    let nz_i = nz as i32;
+
     let (lx, ly, lz) = box_dims;
 
-    // todo: QC if this is the right n!
-    let n = pos_gpu.len(); // todo: QC!
-    let n_u32 = n as u32;
 
-    let cfg = LaunchConfig::for_num_elems(n_u32);
+    // todo: QC if this is the right n!
+    let n = pos_gpu.len() / 3; // todo: QC!
+    let n_u32 = n as u32;
+    let n_i32 = n as i32;
+
+    // let cfg = LaunchConfig::for_num_elems(n_u32);
+    let cfg = launch_cfg(n_u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
     launch_args.arg(pos_gpu);
@@ -438,14 +467,42 @@ fn gather_forces_to_atoms(
 
     launch_args.arg(out_partial_gpu);
 
-    launch_args.arg(&(n_u32));
+    launch_args.arg(&n_i32);
 
-    launch_args.arg(&nx);
-    launch_args.arg(&ny);
-    launch_args.arg(&nz);
+    launch_args.arg(&nx_i);
+    launch_args.arg(&ny_i);
+    launch_args.arg(&nz_i);
     launch_args.arg(&lx);
     launch_args.arg(&ly);
     launch_args.arg(&lz);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
+}
+
+
+fn scale_vec(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    buf: &mut CudaSlice<f32>,
+    s: f32,
+) {
+    let n_i = buf.len() as i32;
+
+    let cfg = LaunchConfig::for_num_elems(n_i as u32);
+
+    let mut lb = stream.launch_builder(kernel);
+    lb.arg(buf);
+    lb.arg(&n_i);
+    lb.arg(&s);
+    unsafe { lb.launch(cfg) }.unwrap();
+}
+
+/// If we run `LaunchConfig::from_num_elems`, we get the error `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+fn launch_cfg(n: u32, block: u32) -> LaunchConfig {
+    let grid = (n + block - 1) / block; // ceil_div
+    LaunchConfig {
+        grid_dim: (grid.max(1), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
