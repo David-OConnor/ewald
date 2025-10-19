@@ -19,6 +19,12 @@ use std::{
     f32::consts::{PI, TAU},
 };
 
+#[cfg(feature = "cuda")]
+use cudarc::{
+    driver::{CudaContext, DevicePtr},
+    nvrtc::Ptx,
+};
+
 #[cfg(feature = "cufft")]
 mod cufft;
 #[cfg(feature = "vkfft")]
@@ -27,20 +33,17 @@ pub mod vk_fft;
 #[cfg(feature = "cuda")]
 mod gpu_shared;
 
-#[cfg(feature = "cufft")]
-use cudarc::driver::DevicePtr;
 use lin_alg::f32::Vec3;
 #[cfg(target_arch = "x86_64")]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
+#[cfg(feature = "cuda")]
+use crate::gpu_shared::{GpuTables, GpuModules};
 
 #[cfg(feature = "cuda")]
-use crate::gpu_shared::GpuTables;
-
-#[cfg(feature = "cuda")]
-pub const PTX: &str = include_str!("../ewald.ptx");
+const PTX: &str = include_str!("../ewald.ptx");
 
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
@@ -80,6 +83,8 @@ pub struct PmeRecip {
     /// This will be None until the first run. It's based on k and bmod values.
     #[cfg(feature = "cuda")]
     gpu_tables: Option<GpuTables>,
+    #[cfg(feature = "cuda")]
+    gpu_modules: GpuModules
 }
 
 impl PmeRecip {
@@ -95,6 +100,28 @@ impl PmeRecip {
         let bmod2_x = spline_bmod2_1d(n.0, SPLINE_ORDER);
         let bmod2_y = spline_bmod2_1d(n.1, SPLINE_ORDER);
         let bmod2_z = spline_bmod2_1d(n.2, SPLINE_ORDER);
+
+        #[cfg(feature = "cuda")]
+        let gpu_modules = {
+            let ctx = CudaContext::new(0).unwrap();
+            let module = ctx.load_module(Ptx::from_src(PTX)).unwrap();
+
+            let kernel_spread = module.load_function("spread_charges").unwrap();
+            let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
+            let kernel_scale = module.load_function("scale_vec").unwrap();
+            let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
+            let kernel_half_spectrum =  module.load_function("energy_half_spectrum").unwrap();
+
+            GpuModules {
+                // module,
+                kernel_spread,
+                kernel_ghat,
+                kernel_scale,
+                kernel_gather,
+                kernel_half_spectrum,
+            }
+        };
+
 
         // Note: planner_gpu and gpu_tables will be null/None until the first run. We
         // handle it this way since the forces fns have access to the stream or Context,
@@ -115,6 +142,8 @@ impl PmeRecip {
             planner_gpu: std::ptr::null_mut(),
             #[cfg(feature = "cuda")]
             gpu_tables: None,
+            #[cfg(feature = "cuda")]
+            gpu_modules
         }
     }
 
@@ -158,14 +187,15 @@ impl PmeRecip {
     /// todo: Is there a way to exclude static targets, or must all sources be targets?
     pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
+
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
-        let n_pts = nx * ny * nz;
-        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_pts];
-        self.spread_charges(posits, q, &mut rho);
+        let n_real = nx * ny * nz;
+        let mut rho_cplx = vec![Complex::<f32>::new(0.0, 0.0); n_real];
+        self.spread_charges(posits, q, &mut rho_cplx);
 
-        fft3_inplace(&mut rho, self.plan_dims, &mut self.planner, true);
+        fft3_inplace(&mut rho_cplx, self.plan_dims, &mut self.planner, true);
 
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -174,9 +204,9 @@ impl PmeRecip {
 
         // eAk are per-dimension phase factors.
         // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        let mut exk = vec![Complex::new(0.0, 0.0); n_pts];
-        let mut eyk = vec![Complex::new(0.0, 0.0); n_pts];
-        let mut ezk = vec![Complex::new(0.0, 0.0); n_pts];
+        let mut exk = vec![Complex::new(0.0, 0.0); n_real];
+        let mut eyk = vec![Complex::new(0.0, 0.0); n_real];
+        let mut ezk = vec![Complex::new(0.0, 0.0); n_real];
 
         let mut energy: f64 = exk
             .par_iter_mut()
@@ -210,7 +240,7 @@ impl PmeRecip {
 
                 // φ(k) = G(k) ρ(k) with B-spline deconvolution
                 let ghat = (2.0 * TAU / vol) * (-k2 / (4.0 * alpha * alpha)).exp() / (k2 * bmod2);
-                let phi_k = rho[idx] * ghat;
+                let phi_k = rho_cplx[idx] * ghat;
 
                 // E(k) = i k φ(k)
                 // todo: QC if you need to flip the sign here on kxv, kyv. (Rem the -)
@@ -223,8 +253,8 @@ impl PmeRecip {
 
                 // reciprocal-space energy density: (1/2) Re{ ρ*(k) φ(k) }
                 // 0.5 * (rho[idx].conj() * phi_k).re as f64
-                let re64 = (rho[idx].re as f64) * (phi_k.re as f64)
-                    + (rho[idx].im as f64) * (phi_k.im as f64);
+                let re64 = (rho_cplx[idx].re as f64) * (phi_k.re as f64)
+                    + (rho_cplx[idx].im as f64) * (phi_k.im as f64);
                 0.5 * re64
             })
             .sum();
@@ -234,7 +264,6 @@ impl PmeRecip {
         energy += self_energy;
 
         // Note: These FFTs are the biggest time bottleneck.
-        // let start = Instant::now();
         // Inverse FFT to real-space E grids
         fft3_inplace(&mut exk, self.plan_dims, &mut self.planner, false);
         fft3_inplace(&mut eyk, self.plan_dims, &mut self.planner, false);
