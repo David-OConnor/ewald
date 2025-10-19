@@ -3,9 +3,7 @@
 
 use std::{ffi::c_void, sync::Arc};
 
-use cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
-};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use lin_alg::f32::{Vec3, vec3s_to_dev};
 
 use crate::PmeRecip;
@@ -14,9 +12,7 @@ use crate::cufft;
 #[cfg(feature = "vkfft")]
 use crate::vk_fft;
 
-
-pub(crate) struct GpuModules {
-    // pub module: Arc<CudaModule>,
+pub(crate) struct Kernels {
     pub kernel_spread: CudaFunction,
     pub kernel_ghat: CudaFunction,
     pub kernel_scale: CudaFunction,
@@ -55,33 +51,11 @@ impl PmeRecip {
     /// We handle it this way to prevent transfering more info to and from the GPU than required.
     pub fn forces_gpu(
         &mut self,
-        #[cfg(feature = "vkfft")] ctx: &Arc<vk_fft::VkContext>,
         stream: &Arc<CudaStream>,
         posits: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
-
-        // We set these up here instead of at init, so we have the stream, and so
-        // init isn't dependent on a stream being passed.
-        if self.gpu_tables.is_none() {
-            // First run
-            let k = (&self.kx, &self.ky, &self.kz);
-            let bmod2 = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
-
-            #[cfg(feature = "cufft")]
-            {
-                self.planner_gpu = cufft::create_gpu_plan(self.plan_dims, stream);
-            }
-            #[cfg(feature = "vkfft")]
-            {
-                self.planner_gpu = vk_fft::create_gpu_plan(self.plan_dims, ctx);
-            }
-
-            self.gpu_tables = Some(GpuTables::new(k, bmod2, stream));
-        }
-
-        let tables = self.gpu_tables.as_ref().unwrap();
 
         let (nx, ny, nz) = self.plan_dims;
 
@@ -124,7 +98,7 @@ impl PmeRecip {
         // todo: Why do we spread rho_real here, but rho_cplx on the CPU path?
         spread_charges(
             stream,
-            &self.gpu_modules.kernel_spread,
+            &self.kernels.kernel_spread,
             &pos_gpu,
             &q_gpu,
             &mut rho_real_gpu,
@@ -145,12 +119,12 @@ impl PmeRecip {
         // Apply G(k) and gradient to get Exk/Eyk/Ezk
         apply_ghat_and_grad(
             stream,
-            &self.gpu_modules.kernel_ghat,
+            &self.kernels.kernel_ghat,
             &mut rho_cplx_gpu,
             &mut ekx_gpu,
             &mut eky_gpu,
             &mut ekz_gpu,
-            tables,
+            &self.gpu_tables,
             self.plan_dims,
             self.vol,
             self.alpha,
@@ -171,16 +145,16 @@ impl PmeRecip {
 
         let inv_n = 1.0f32 / (n_real as f32);
 
-        scale_vec(stream, &self.gpu_modules.kernel_scale, &mut ex_gpu, inv_n);
-        scale_vec(stream, &self.gpu_modules.kernel_scale, &mut ey_gpu, inv_n);
-        scale_vec(stream, &self.gpu_modules.kernel_scale, &mut ez_gpu, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ex_gpu, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ey_gpu, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ez_gpu, inv_n);
 
         let n_atoms = posits.len();
         let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * n_atoms).unwrap();
 
         gather_forces_to_atoms(
             stream,
-            &self.gpu_modules.kernel_gather,
+            &self.kernels.kernel_gather,
             &pos_gpu,
             &q_gpu,
             &ex_gpu,
@@ -196,10 +170,10 @@ impl PmeRecip {
 
         energy_half_spectrum(
             stream,
-            &self.gpu_modules.kernel_half_spectrum,
+            &self.kernels.kernel_half_spectrum,
             &mut rho_cplx_gpu,
             &mut out_partial_gpu,
-            tables,
+            &self.gpu_tables,
             self.plan_dims,
             self.vol,
             self.alpha,

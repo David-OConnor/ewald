@@ -17,11 +17,12 @@ use std::ffi::c_void;
 use std::{
     arch::x86_64::{_CMP_LT_OQ, _mm256_blendv_ps, _mm256_cmp_ps, _mm256_set1_ps},
     f32::consts::{PI, TAU},
+    sync::Arc,
 };
 
 #[cfg(feature = "cuda")]
 use cudarc::{
-    driver::{CudaContext, DevicePtr},
+    driver::{CudaContext, CudaStream, DevicePtr},
     nvrtc::Ptx,
 };
 
@@ -39,8 +40,9 @@ use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
+
 #[cfg(feature = "cuda")]
-use crate::gpu_shared::{GpuTables, GpuModules};
+use crate::gpu_shared::{GpuTables, Kernels};
 
 #[cfg(feature = "cuda")]
 const PTX: &str = include_str!("../ewald.ptx");
@@ -82,13 +84,20 @@ pub struct PmeRecip {
     planner_gpu: *mut c_void,
     /// This will be None until the first run. It's based on k and bmod values.
     #[cfg(feature = "cuda")]
-    gpu_tables: Option<GpuTables>,
+    gpu_tables: GpuTables,
     #[cfg(feature = "cuda")]
-    gpu_modules: GpuModules
+    kernels: Kernels,
+    #[cfg(feature = "vkfft")]
+    vk_ctx: Arc<vk_fft::VkContext>,
 }
 
 impl PmeRecip {
-    pub fn new(n: (usize, usize, usize), l: (f32, f32, f32), alpha: f32) -> Self {
+    pub fn new(
+        #[cfg(feature = "cuda")] stream: &Arc<CudaStream>,
+        n: (usize, usize, usize),
+        l: (f32, f32, f32),
+        alpha: f32,
+    ) -> Self {
         assert!(n.0 >= 4 && n.1 >= 4 && n.2 >= 4);
 
         let vol = l.0 * l.1 * l.2;
@@ -102,26 +111,43 @@ impl PmeRecip {
         let bmod2_z = spline_bmod2_1d(n.2, SPLINE_ORDER);
 
         #[cfg(feature = "cuda")]
-        let gpu_modules = {
-            let ctx = CudaContext::new(0).unwrap();
-            let module = ctx.load_module(Ptx::from_src(PTX)).unwrap();
+        let (kernels, gpu_tables) = {
+            let kernels = {
+                let ctx = CudaContext::new(0).unwrap();
+                let module = ctx.load_module(Ptx::from_src(PTX)).unwrap();
 
-            let kernel_spread = module.load_function("spread_charges").unwrap();
-            let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
-            let kernel_scale = module.load_function("scale_vec").unwrap();
-            let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
-            let kernel_half_spectrum =  module.load_function("energy_half_spectrum").unwrap();
+                let kernel_spread = module.load_function("spread_charges").unwrap();
+                let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
+                let kernel_scale = module.load_function("scale_vec").unwrap();
+                let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
+                let kernel_half_spectrum = module.load_function("energy_half_spectrum").unwrap();
 
-            GpuModules {
-                // module,
-                kernel_spread,
-                kernel_ghat,
-                kernel_scale,
-                kernel_gather,
-                kernel_half_spectrum,
-            }
+                Kernels {
+                    kernel_spread,
+                    kernel_ghat,
+                    kernel_scale,
+                    kernel_gather,
+                    kernel_half_spectrum,
+                }
+            };
+
+            let tables = {
+                let k = (&kx, &ky, &kz);
+                let bmod2 = (&bmod2_x, &bmod2_y, &bmod2_z);
+
+                GpuTables::new(k, bmod2, stream)
+            };
+
+            (kernels, tables)
         };
 
+        #[cfg(feature = "cufft")]
+        let planner_gpu = cufft::create_gpu_plan(n, stream);
+
+        #[cfg(feature = "vkfft")]
+        let vk_ctx = Arc::new(vk_fft::VkContext::default());
+        #[cfg(feature = "vkfft")]
+        let planner_gpu = vk_fft::create_gpu_plan(n, &vk_ctx);
 
         // Note: planner_gpu and gpu_tables will be null/None until the first run. We
         // handle it this way since the forces fns have access to the stream or Context,
@@ -139,11 +165,13 @@ impl PmeRecip {
             bmod2_z,
             planner: FftPlanner::new(),
             #[cfg(feature = "cuda")]
-            planner_gpu: std::ptr::null_mut(),
+            planner_gpu,
             #[cfg(feature = "cuda")]
-            gpu_tables: None,
+            gpu_tables,
             #[cfg(feature = "cuda")]
-            gpu_modules
+            kernels,
+            #[cfg(feature = "vkfft")]
+            vk_ctx,
         }
     }
 
