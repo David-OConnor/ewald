@@ -12,13 +12,12 @@
 
 extern crate core;
 
-#[cfg(feature = "cuda")]
-use std::ffi::c_void;
 use std::{
     arch::x86_64::{_CMP_LT_OQ, _mm256_blendv_ps, _mm256_cmp_ps, _mm256_set1_ps},
     f32::consts::{PI, TAU},
-    sync::Arc,
 };
+#[cfg(feature = "cuda")]
+use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cuda")]
 use cudarc::{
@@ -175,8 +174,7 @@ impl PmeRecip {
         }
     }
 
-    /// CPU charge spreading.
-    // todo: QC this against the charge spreading you use for GPU.
+    /// CPU charge spreading. Note that we only operate on the real part of rho.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
         let (nx, ny, nz) = self.plan_dims;
         let (lx, ly, lz) = self.box_dims;
@@ -200,9 +198,11 @@ impl PmeRecip {
                     let iy = wrap(iy0 + b as isize, ny);
                     let wxy = wxa * wy[b];
 
+                    let base = iy * nx + ix;
+
                     for c in 0..SPLINE_ORDER {
                         let iz = wrap(iz0 + c as isize, nz);
-                        let idx = iz * nxny + iy * nx + ix;
+                        let idx = iz * nxny + base;
                         rho[idx].re += qi * wxy * wz[c];
                     }
                 }
@@ -220,10 +220,11 @@ impl PmeRecip {
         let (nx, ny, nz) = self.plan_dims;
 
         let n_real = nx * ny * nz;
-        let mut rho_cplx = vec![Complex::<f32>::new(0.0, 0.0); n_real];
-        self.spread_charges(posits, q, &mut rho_cplx);
+        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_real];
 
-        fft3_inplace(&mut rho_cplx, self.plan_dims, &mut self.planner, true);
+        self.spread_charges(posits, q, &mut rho);
+
+        fft3_inplace(&mut rho, self.plan_dims, &mut self.planner, true);
 
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -251,6 +252,7 @@ impl PmeRecip {
                 let kzv = kz[iz];
 
                 let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
+
                 if k2 == 0.0 {
                     *ex = Complex::new(0.0, 0.0);
                     *ey = Complex::new(0.0, 0.0);
@@ -266,24 +268,23 @@ impl PmeRecip {
                     return 0.;
                 }
 
+                const TWO_TAU: f32 = 2. * TAU;
+
                 // φ(k) = G(k) ρ(k) with B-spline deconvolution
-                let ghat = (2.0 * TAU / vol) * (-k2 / (4.0 * alpha * alpha)).exp() / (k2 * bmod2);
-                let phi_k = rho_cplx[idx] * ghat;
+                let ghat = (TWO_TAU / vol) * (-k2 / (4.0 * alpha * alpha)).exp() / (k2 * bmod2);
+                let phi_k = rho[idx] * ghat;
 
                 // E(k) = i k φ(k)
-                // todo: QC if you need to flip the sign here on kxv, kyv. (Rem the -)
-                // *ex = Complex::new(0.0, -kxv) * phi_k;
-                // *ey = Complex::new(0.0, -kyv) * phi_k;
-                // *ez = Complex::new(0.0, -kzv) * phi_k;
                 *ex = Complex::new(0.0, kxv) * phi_k;
                 *ey = Complex::new(0.0, kyv) * phi_k;
                 *ez = Complex::new(0.0, kzv) * phi_k;
 
                 // reciprocal-space energy density: (1/2) Re{ ρ*(k) φ(k) }
                 // 0.5 * (rho[idx].conj() * phi_k).re as f64
-                let re64 = (rho_cplx[idx].re as f64) * (phi_k.re as f64)
-                    + (rho_cplx[idx].im as f64) * (phi_k.im as f64);
-                0.5 * re64
+                let energy = (rho[idx].re as f64) * (phi_k.re as f64)
+                    + (rho[idx].im as f64) * (phi_k.im as f64);
+
+                0.5 * energy
             })
             .sum();
 
@@ -384,7 +385,9 @@ fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
         } else {
             let t = PI * (k as f32) / (n as f32); // = |ω|/2 with ω=2πk/n
             let s = t.sin() / t; // sinc(|ω|/2)
-            *val = s.powi((m as i32) * 2); // |B(ω)|^2 = sinc^(2m)
+
+            let eps = 1e-12;
+            *val = (s.powi((m as i32) * 2)).max(eps); // |B(ω)|^2 = sinc^(2m)
         }
     }
     v
@@ -491,19 +494,6 @@ fn fft3_inplace(
             }
         }
     }
-
-    // rustfft inverse is unnormalized; many MD codes keep that and balance elsewhere.
-    // If you prefer normalized inverse, scale here by 1/(nx*ny*nz) after inverse passes.
-
-    // todo: I think we must remove this?
-    // if !forward {
-    //     let len = nx * ny * nz;
-    //     let scale = 1.0 / (len as f32);
-    //     for v in data.iter_mut() {
-    //         v.re *= scale;
-    //         v.im *= scale;
-    //     }
-    // }
 }
 
 /// We use this to smoothly switch between short-range and long-range (reciprical) forces.
@@ -524,7 +514,8 @@ fn _taper(s: f64) -> (f64, f64) {
 ///  Ideally, use a combined GPU kernel with Lennard Jones, or a SIMD variant, instead of this.
 ///  We use this for short-range Coulomb forces on the CPU, as part of SPME.
 /// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
-/// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å.
+/// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å. It truncates
+/// the real-space interaction. Th reciprical part does not use this.
 ///
 /// This assumes diff (and dir) is in order tgt - src.
 /// Also returns potential energy.

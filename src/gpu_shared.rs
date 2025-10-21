@@ -95,7 +95,6 @@ impl PmeRecip {
 
         // -----------------------------------
 
-        // todo: Why do we spread rho_real here, but rho_cplx on the CPU path?
         spread_charges(
             stream,
             &self.kernels.kernel_spread,
@@ -280,7 +279,7 @@ fn spread_charges(
 
     let n_atoms_i = n_posits as i32;
 
-    let cfg = launch_cfg(n_posits as u32, 256);
+    let cfg = launch_cfg(n_posits, 256);
 
     let mut launch_args = stream.launch_builder(kernel);
 
@@ -319,6 +318,7 @@ fn apply_ghat_and_grad(
     let nz_i = nz as i32;
 
     let n = nx * ny * (nz / 2 + 1);
+    let n_real = (nx * ny * nz) as i32;
 
     // let cfg = LaunchConfig::for_num_elems(n as u32);
     let cfg = launch_cfg(n as u32, 256);
@@ -343,6 +343,8 @@ fn apply_ghat_and_grad(
 
     launch_args.arg(&vol);
     launch_args.arg(&alpha);
+
+    launch_args.arg(&n_real);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
