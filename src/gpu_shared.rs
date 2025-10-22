@@ -5,6 +5,7 @@ use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use lin_alg::f32::{Vec3, vec3s_to_dev};
+use rustfft::num_complex::Complex;
 
 use crate::PmeRecip;
 #[cfg(feature = "cufft")]
@@ -67,71 +68,93 @@ impl PmeRecip {
 
         // todo: Should we init these once and store, instead of re-allocating at each step?
         // Set up positions, rho, and charge on the GPU once; they'll be used a few times in this function.
-        let pos_gpu = vec3s_to_dev(stream, posits);
-        let q_gpu = stream.memcpy_stod(q).unwrap();
+        let pos_dev = vec3s_to_dev(stream, posits);
+        let q_dev = stream.memcpy_stod(q).unwrap();
 
-        let mut rho_real_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut rho_cplx_gpu: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        // let mut rho_real_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        // let mut rho_cplx_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
 
-        // Contiguous complex buffer: [exk | eyk | ezk]
-        // let ekx_eky_ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
-        let mut ekx_gpu: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let mut eky_gpu: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let mut ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        // GPU buffers of complex numbers are flattened.
 
-        // k-space pointers for FFT FFI)
-        let ekx_ptr = cuda_slice_to_ptr_mut(&ekx_gpu, stream);
-        let eky_ptr = cuda_slice_to_ptr_mut(&eky_gpu, stream);
-        let ekz_ptr = cuda_slice_to_ptr_mut(&ekz_gpu, stream);
-
-        // // todo: Pre-allocate these instead of every step?
-        let mut ex_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut ey_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut ez_gpu: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-
-        let ex_ptr = cuda_slice_to_ptr_mut(&ex_gpu, stream);
-        let ey_ptr = cuda_slice_to_ptr_mut(&ey_gpu, stream);
-        let ez_ptr = cuda_slice_to_ptr_mut(&ez_gpu, stream);
-
-        // -----------------------------------
+        // Charge density.
+        let mut rho_real_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut rho_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
 
         spread_charges(
             stream,
             &self.kernels.kernel_spread,
-            &pos_gpu,
-            &q_gpu,
-            &mut rho_real_gpu,
+            &pos_dev,
+            &q_dev,
+            &mut rho_real_dev,
             self.plan_dims,
             self.box_dims,
             posits.len() as u32,
         );
 
-        // Forward FFT on GPU: real -> half complex
+        // // todo temp
+        {
+            let rho_cpu = stream.memcpy_dtov(&rho_real_dev).unwrap();
+            for i in 0..10 {
+                println!("Q spread GPU pre fwd FFT (re): {:?}", rho_cpu[i])
+            }
+        }
+
+        // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
-            exec_forward_r2c(
+            exec_forward(
                 self.planner_gpu,
-                cuda_slice_to_ptr_mut(&rho_real_gpu, stream),
-                cuda_slice_to_ptr_mut(&rho_cplx_gpu, stream),
+                cuda_slice_to_ptr_mut(&rho_real_dev, stream),
+                cuda_slice_to_ptr_mut(&rho_dev, stream),
             );
         }
+
+        {
+            let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
+            let mut rho_dbg = Vec::new();
+            for i in 0..complex_len / 2 {
+                rho_dbg.push(Complex::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
+            }
+            for i in 0..10 {
+                println!("Q spread GPU post fwd FFT: {:?}", rho_dbg[i])
+            }
+        }
+
+        // todo: Pre-allocate these instead of every step?
+        let mut ex_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut ey_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let mut ez_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+
+        // Contiguous complex buffer: [exk | eyk | ezk]
+        // let ekx_eky_ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
+        let mut exk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        let mut eyk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        let mut ezk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+
+        // k-space pointers for FFT FFI)
+        let ekx_ptr = cuda_slice_to_ptr_mut(&exk_dev, stream);
+        let eky_ptr = cuda_slice_to_ptr_mut(&eyk_dev, stream);
+        let ekz_ptr = cuda_slice_to_ptr_mut(&ezk_dev, stream);
 
         // Apply G(k) and gradient to get Exk/Eyk/Ezk
         apply_ghat_and_grad(
             stream,
             &self.kernels.kernel_ghat,
-            &mut rho_cplx_gpu,
-            &mut ekx_gpu,
-            &mut eky_gpu,
-            &mut ekz_gpu,
+            &mut rho_dev,
+            &mut exk_dev,
+            &mut eyk_dev,
+            &mut ezk_dev,
             &self.gpu_tables,
             self.plan_dims,
             self.vol,
             self.alpha,
         );
 
+        let ex_ptr = cuda_slice_to_ptr_mut(&ex_dev, stream);
+        let ey_ptr = cuda_slice_to_ptr_mut(&ey_dev, stream);
+        let ez_ptr = cuda_slice_to_ptr_mut(&ez_dev, stream);
+
         unsafe {
-            // Inverse batched C2R: (exk,eyk,ezk) -> (ex,ey,ez)
-            exec_inverse_ExEyEz_c2r(
+            exec_inverse(
                 self.planner_gpu,
                 ekx_ptr,
                 eky_ptr,
@@ -144,9 +167,9 @@ impl PmeRecip {
 
         let inv_n = 1.0f32 / (n_real as f32);
 
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ex_gpu, inv_n);
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ey_gpu, inv_n);
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ez_gpu, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ex_dev, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ey_dev, inv_n);
+        scale_vec(stream, &self.kernels.kernel_scale, &mut ez_dev, inv_n);
 
         let n_atoms = posits.len();
         let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * n_atoms).unwrap();
@@ -154,11 +177,11 @@ impl PmeRecip {
         gather_forces_to_atoms(
             stream,
             &self.kernels.kernel_gather,
-            &pos_gpu,
-            &q_gpu,
-            &ex_gpu,
-            &ey_gpu,
-            &ez_gpu,
+            &pos_dev,
+            &q_dev,
+            &ex_dev,
+            &ey_dev,
+            &ez_dev,
             &mut out_f_gpu,
             self.plan_dims,
             self.box_dims,
@@ -170,7 +193,7 @@ impl PmeRecip {
         energy_half_spectrum(
             stream,
             &self.kernels.kernel_half_spectrum,
-            &mut rho_cplx_gpu,
+            &mut rho_dev,
             &mut out_partial_gpu,
             &self.gpu_tables,
             self.plan_dims,
@@ -202,9 +225,9 @@ impl PmeRecip {
 // FFI for GPU FFT functions. These signatures are the same for cuFFT and vkFFT, so we use
 // them for both.
 unsafe extern "C" {
-    pub(crate) fn exec_forward_r2c(plan: *mut c_void, rho_real: *mut c_void, rho_k: *mut c_void);
+    pub(crate) fn exec_forward(plan: *mut c_void, rho_real: *mut c_void, rho: *mut c_void);
 
-    pub(crate) fn exec_inverse_ExEyEz_c2r(
+    pub(crate) fn exec_inverse(
         plan: *mut c_void,
         exk: *mut c_void,
         eyk: *mut c_void,
@@ -222,7 +245,7 @@ impl Drop for PmeRecip {
                 #[cfg(feature = "vkfft")]
                 vk_fft::destroy_plan(self.planner_gpu);
                 #[cfg(feature = "cufft")]
-                cufft::destroy_plan_r2c_c2r_many(self.planner_gpu);
+                cufft::destroy_plan(self.planner_gpu);
                 self.planner_gpu = std::ptr::null_mut();
             }
         }
@@ -259,13 +282,14 @@ pub(crate) fn split3(
 }
 
 /// Launch the GPU kernel that spreads charges.
+/// todo note: Getting the same values as on CPU here.
 fn spread_charges(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
     // posit, q and rho are passed as CudaSlices, as they're used elsewhere in the flow.
-    pos_gpu: &CudaSlice<f32>,
-    q_gpu: &CudaSlice<f32>,
-    rho_real_gpu: &mut CudaSlice<f32>,
+    pos_dev: &CudaSlice<f32>,
+    q_dev: &CudaSlice<f32>,
+    rho_dev: &mut CudaSlice<f32>, // real only.
     plan_dims: (usize, usize, usize),
     box_dims: (f32, f32, f32),
     n_posits: u32,
@@ -283,9 +307,9 @@ fn spread_charges(
 
     let mut launch_args = stream.launch_builder(kernel);
 
-    launch_args.arg(pos_gpu);
-    launch_args.arg(q_gpu);
-    launch_args.arg(rho_real_gpu);
+    launch_args.arg(pos_dev);
+    launch_args.arg(q_dev);
+    launch_args.arg(rho_dev);
 
     launch_args.arg(&n_atoms_i);
 

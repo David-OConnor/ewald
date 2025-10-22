@@ -25,6 +25,8 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
+mod fft;
+
 #[cfg(feature = "cufft")]
 mod cufft;
 #[cfg(feature = "vkfft")]
@@ -37,11 +39,14 @@ use lin_alg::f32::Vec3;
 #[cfg(target_arch = "x86_64")]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use rayon::prelude::*;
+use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
 #[cfg(feature = "cuda")]
 use crate::gpu_shared::{GpuTables, Kernels};
+
+use crate::fft::{fft3_c2r, fft3_r2c};
 
 #[cfg(feature = "cuda")]
 const PTX: &str = include_str!("../ewald.ptx");
@@ -174,8 +179,8 @@ impl PmeRecip {
         }
     }
 
-    /// CPU charge spreading. Note that we only operate on the real part of rho.
-    fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [Complex_]) {
+    /// CPU charge spreading.
+    fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
         let (nx, ny, nz) = self.plan_dims;
         let (lx, ly, lz) = self.box_dims;
 
@@ -203,7 +208,7 @@ impl PmeRecip {
                     for c in 0..SPLINE_ORDER {
                         let iz = wrap(iz0 + c as isize, nz);
                         let idx = iz * nxny + base;
-                        rho[idx].re += qi * wxy * wz[c];
+                        rho[idx] += qi * wxy * wz[c];
                     }
                 }
             }
@@ -220,11 +225,28 @@ impl PmeRecip {
         let (nx, ny, nz) = self.plan_dims;
 
         let n_real = nx * ny * nz;
-        let mut rho = vec![Complex::<f32>::new(0.0, 0.0); n_real];
+        let nxc = nx / 2 + 1;
+        let n_k = nxc * ny * nz;
 
-        self.spread_charges(posits, q, &mut rho);
+        // Charge density.
+        // let mut rho_real = vec![Complex_::new(0.0, 0.0); n_real];
+        let mut rho_real = vec![0.; n_real];
 
-        fft3_inplace(&mut rho, self.plan_dims, &mut self.planner, true);
+        self.spread_charges(posits, q, &mut rho_real);
+
+        for i in 0..10 {
+            println!("Q spread CPU pre fwd FFT: {:?}", rho_real[i])
+        }
+
+        // Convert spread charges to K space (Hermitian packed along X)
+        let mut rho = fft3_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
+
+        // // Convert the spread charges to K space. They will be complex, and in the frequency domain.
+        // fft3_inplace(&mut rho_real, self.plan_dims, &mut self.planner, true);
+
+        for i in 0..10 {
+            println!("Q spread post post fwd FFT: {:?}", rho[i])
+        }
 
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
@@ -233,9 +255,12 @@ impl PmeRecip {
 
         // eAk are per-dimension phase factors.
         // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        let mut exk = vec![Complex::new(0.0, 0.0); n_real];
-        let mut eyk = vec![Complex::new(0.0, 0.0); n_real];
-        let mut ezk = vec![Complex::new(0.0, 0.0); n_real];
+        // let mut exk = vec![Complex::new(0.0, 0.0); n_real];
+        // let mut eyk = vec![Complex::new(0.0, 0.0); n_real];
+        // let mut ezk = vec![Complex::new(0.0, 0.0); n_real];
+        let mut exk = vec![Complex::new(0.0, 0.0); n_k];
+        let mut eyk = vec![Complex::new(0.0, 0.0); n_k];
+        let mut ezk = vec![Complex::new(0.0, 0.0); n_k];
 
         let mut energy: f64 = exk
             .par_iter_mut()
@@ -292,11 +317,16 @@ impl PmeRecip {
             * q.iter().map(|&qi| (qi as f64) * (qi as f64)).sum::<f64>();
         energy += self_energy;
 
-        // Note: These FFTs are the biggest time bottleneck.
-        // Inverse FFT to real-space E grids
-        fft3_inplace(&mut exk, self.plan_dims, &mut self.planner, false);
-        fft3_inplace(&mut eyk, self.plan_dims, &mut self.planner, false);
-        fft3_inplace(&mut ezk, self.plan_dims, &mut self.planner, false);
+        // // Note: These FFTs are the biggest time bottleneck.
+        // // Inverse FFT to real-space E grids
+        // fft3_inplace(&mut exk, self.plan_dims, &mut self.planner, false);
+        // fft3_inplace(&mut eyk, self.plan_dims, &mut self.planner, false);
+        // fft3_inplace(&mut ezk, self.plan_dims, &mut self.planner, false);
+
+        // Inverse FFT to real-space E grids (C2R)
+        let mut ex = fft3_c2r(&mut exk, self.plan_dims, &mut self.planner);
+        let mut ey = fft3_c2r(&mut eyk, self.plan_dims, &mut self.planner);
+        let mut ez = fft3_c2r(&mut ezk, self.plan_dims, &mut self.planner);
 
         // Interpolate E back to particles with the same B-spline weights; F = q E
 
@@ -308,9 +338,9 @@ impl PmeRecip {
                 let (iy0, wy) = bspline4_weights(r.y / ly * ny as f32);
                 let (iz0, wz) = bspline4_weights(r.z / lz * nz as f32);
 
-                let mut ex = 0.0f64;
-                let mut ey = 0.0f64;
-                let mut ez = 0.0f64;
+                let mut ex_v = 0.0f64;
+                let mut ey_v = 0.0f64;
+                let mut ez_v = 0.0f64;
 
                 for a in 0..4 {
                     let ix = wrap(ix0 + a as isize, nx);
@@ -326,20 +356,18 @@ impl PmeRecip {
                             let w = (wxy * wz[c]) as f64;
                             let idx = iz * (nx * ny) + iy * nx + ix;
 
-                            // println!("V: {:?}", exk[idx]);
-
-                            ex = w.mul_add(exk[idx].re as f64, ex);
-                            ey = w.mul_add(eyk[idx].re as f64, ey);
-                            ez = w.mul_add(ezk[idx].re as f64, ez);
+                            ex_v = w.mul_add(ex[idx] as f64, ex_v);
+                            ey_v = w.mul_add(ey[idx] as f64, ey_v);
+                            ez_v = w.mul_add(ez[idx] as f64, ez_v);
                         }
                     }
                 }
 
                 let qi = q[i] as f64;
                 Vec3 {
-                    x: (ex * qi) as f32,
-                    y: (ey * qi) as f32,
-                    z: (ez * qi) as f32,
+                    x: (ex_v * qi) as f32,
+                    y: (ey_v * qi) as f32,
+                    z: (ez_v * qi) as f32,
                 }
             })
             .collect();
@@ -422,94 +450,6 @@ fn wrap(i: isize, n: usize) -> usize {
     v as usize
 }
 
-/// Minimal, cache-friendly 3D FFT using rustfft 1D plans along each axis.
-/// dir=true => forward; dir=false => inverse (and rustfft handles scaling=1).
-fn fft3_inplace(
-    data: &mut [Complex_],
-    dims: (usize, usize, usize),
-    planner: &mut FftPlanner<f32>,
-    forward: bool,
-) {
-    let (nx, ny, nz) = dims;
-
-    let fft_x = if forward {
-        planner.plan_fft_forward(nx)
-    } else {
-        planner.plan_fft_inverse(nx)
-    };
-    let fft_y = if forward {
-        planner.plan_fft_forward(ny)
-    } else {
-        planner.plan_fft_inverse(ny)
-    };
-    let fft_z = if forward {
-        planner.plan_fft_forward(nz)
-    } else {
-        planner.plan_fft_inverse(nz)
-    };
-
-    // X transforms (contiguous)
-    for iz in 0..nz {
-        for iy in 0..ny {
-            let row = iz * (nx * ny) + iy * nx;
-            let slice = &mut data[row..row + nx];
-            fft_x.process(slice);
-        }
-    }
-
-    // Y transforms (strided by nx)
-    {
-        let mut tmp = vec![Complex::<f32>::new(0.0, 0.0); ny];
-        for iz in 0..nz {
-            for ix in 0..nx {
-                // gather
-                for (j, iy) in (0..ny).enumerate() {
-                    tmp[j] = data[iz * (nx * ny) + iy * nx + ix];
-                }
-                // fft
-                fft_y.process(&mut tmp);
-                // scatter
-                for (j, iy) in (0..ny).enumerate() {
-                    data[iz * (nx * ny) + iy * nx + ix] = tmp[j];
-                }
-            }
-        }
-    }
-
-    // Z transforms (strided by nx*ny)
-    {
-        let mut tmp = vec![Complex::<f32>::new(0.0, 0.0); nz];
-        for iy in 0..ny {
-            for ix in 0..nx {
-                // gather
-                for (k, iz) in (0..nz).enumerate() {
-                    tmp[k] = data[iz * (nx * ny) + iy * nx + ix];
-                }
-                // fft
-                fft_z.process(&mut tmp);
-                // scatter
-                for (k, iz) in (0..nz).enumerate() {
-                    data[iz * (nx * ny) + iy * nx + ix] = tmp[k];
-                }
-            }
-        }
-    }
-}
-
-/// We use this to smoothly switch between short-range and long-range (reciprical) forces.
-/// todo: Hard cut off, vice taper, for now.
-fn _taper(s: f64) -> (f64, f64) {
-    // s in [0,1]; returns (S, dS/dr * dr/ds) but we’ll just return S and dS/ds here.
-    // Quintic: S = 1 - 10 s^3 + 15 s^4 - 6 s^5;  dS/ds = -30 s^2 + 60 s^3 - 30 s^4
-    let s2 = s * s;
-    let s3 = s2 * s;
-    let s4 = s3 * s;
-    let s5 = s4 * s;
-    let s_val = 1.0 - 10.0 * s3 + 15.0 * s4 - 6.0 * s5;
-    let ds = -30.0 * s2 + 60.0 * s3 - 30.0 * s4;
-
-    (s_val, ds)
-}
 
 ///  Ideally, use a combined GPU kernel with Lennard Jones, or a SIMD variant, instead of this.
 ///  We use this for short-range Coulomb forces on the CPU, as part of SPME.

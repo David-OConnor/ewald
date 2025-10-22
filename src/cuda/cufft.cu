@@ -32,7 +32,7 @@ struct PlanWrap {
 };
 
 extern "C"
-void* make_plan_r2c_c2r_many(int nx, int ny, int nz, void* cu_stream) {
+void* make_plan(int nx, int ny, int nz, void* cu_stream) {
     auto* w = new PlanWrap();
     w->nx = nx; w->ny = ny; w->nz = nz;
     w->n_real  = size_t(nx)*ny*nz;
@@ -64,50 +64,42 @@ void* make_plan_r2c_c2r_many(int nx, int ny, int nz, void* cu_stream) {
 
 
 extern "C"
-void destroy_plan_r2c_c2r_many(void* plan) {
+void destroy_plan(void* plan) {
     auto* w = reinterpret_cast<PlanWrap*>(plan);
     if (!w) return;
+
     cufftDestroy(w->plan_r2c);
-//     cufftDestroy(w->plan_c2r_many);
     cufftDestroy(w->plan_c2r);
+
     delete w;
 }
 
+// https://docs.nvidia.com/cuda/cufft/#cufftexecr2c-and-cufftexecd2z
+// Performs a forward real-to-copmlex FFT of rho. Note: This is more efficient
+// than complex-to-complex.
 extern "C"
-void exec_forward_r2c(void* plan, float* rho_real, cufftComplex* rho_k) {
+void exec_forward(void* plan, float* rho_real, cufftComplex* rho) {
     auto* w = reinterpret_cast<PlanWrap*>(plan);
     if (!w) return;
-    CUFFT_CHECK(cufftExecR2C(w->plan_r2c, rho_real, rho_k));
+
+    CUFFT_CHECK(cufftExecR2C(w->plan_r2c, rho_real, rho));
 }
 
 extern "C"
-void exec_inverse_ExEyEz_c2r(
+void exec_inverse(
     void* plan,
-    cufftComplex* exk, cufftComplex* eyk, cufftComplex* ezk,
-    float* ex, float* ey, float* ez
+    cufftComplex* exk,
+    cufftComplex* eyk,
+    cufftComplex* ezk,
+    float* ex,
+    float* ey,
+    float* ez
 ){
     auto* w = reinterpret_cast<PlanWrap*>(plan);
     if (!w) return;
+
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r, exk, ex));
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r, eyk, ey));
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r, ezk, ez));
 }
-
-// extern "C"
-// void exec_inverse_ExEyEz_c2r(
-//     void* plan,
-//     cufftComplex* exk, /* base of [exk|eyk|ezk] */
-//     cufftComplex* /*eyk*/,
-//     cufftComplex* /*ezk*/,
-//     float* ex /* base of [ex|ey|ez] */,
-//     float* /*ey*/,
-//     float* /*ez*/
-// ){
-//     auto* w = reinterpret_cast<PlanWrap*>(plan);
-//     if (!w) return;
-//
-//     // exk must point to 3*n_cmplx contiguous cufftComplex
-//     // ex  must point to 3*n_real   contiguous float
-//     CUFFT_CHECK(cufftExecC2R(w->plan_c2r_many, exk, ex));
-// }
 

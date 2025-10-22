@@ -7,17 +7,17 @@
 // Note: We use float2 instead of cufftComplex, as it doesn't rely on cuFFT.
 
 __device__ __forceinline__
-int wrap(int a, int n) {
+int wrap(int32_t a, int32_t n) {
     a %= n; return (a < 0) ? a + n : a;
 }
 
 
 //  Corresponds directly to a host function.
 __device__
-void bspline4_weights(float s, int* i0, float w[4]) {
+void bspline4_weights(float s, int32_t* i0, float w[4]) {
     float sfloor = floorf(s);
     float u = s - sfloor;
-    *i0 = (int)sfloor - 1;
+    *i0 = (int32_t)sfloor - 1;
 
     float u2 = u * u;
     float u3 = fmaf(u2, u, 0.0f);
@@ -35,16 +35,16 @@ void bspline4_weights(float s, int* i0, float w[4]) {
     w[3] = w3;
 }
 
-// Kernel for charge spreading. Corresponds directly to a host function.
+// Kernel for charge spreading. Corresponds directly to a equivalent CPU function.
 extern "C" __global__
 void spread_charges(
     const float3* pos,
     const float*  q,
-    float* rho,  // real grid, size nx*ny*nz
-    int n_atoms,
-    int nx,
-    int ny,
-    int nz,
+    float* rho, // real part
+    int32_t n_atoms,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
     float lx,
     float ly,
     float lz
@@ -52,7 +52,7 @@ void spread_charges(
     size_t i0 = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
-    int nxny = nx * ny;
+    size_t nxny = nx * ny;
 
     for (size_t i = i0; i < (size_t)n_atoms; i += stride) {
         float3 r = pos[i];
@@ -61,7 +61,7 @@ void spread_charges(
         float sy = r.y / ly * ny;
         float sz = r.z / lz * nz;
 
-        int ix0, iy0, iz0;
+        int32_t ix0, iy0, iz0;
         float wx[4], wy[4], wz[4];
 
         bspline4_weights(sx, &ix0, wx);
@@ -70,18 +70,18 @@ void spread_charges(
 
         float qi = q[i];
 
-        for (int a=0; a<4; a++) {
-            int ix = wrap(ix0 + a, nx);
+        for (int32_t a=0; a<4; a++) {
+            int32_t ix = wrap(ix0 + a, nx);
             float wxa = wx[a];
 
-            for (int b=0; b<4; b++) {
-                int iy = wrap(iy0 + b, ny);
+            for (int32_t b=0; b<4; b++) {
+                int32_t iy = wrap(iy0 + b, ny);
                 float wxy = wxa * wy[b];
 
-                int base = iy * nx + ix;
+                int32_t base = iy * nx + ix;
 
-                for (int c=0; c<4; c++) {
-                    int iz = wrap(iz0 + c, nz);
+                for (int32_t c=0; c<4; c++) {
+                    int32_t iz = wrap(iz0 + c, nz);
                     size_t idx = size_t(iz) * nxny + base;
                     atomicAdd(&rho[idx], qi * wxy * wz[c]);
                 }
@@ -106,22 +106,22 @@ void apply_ghat_and_grad(
     const float* bx,
     const float* by,
     const float* bz,
-    int nx, 
-    int ny,
-    int nz,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
     float vol,
     float alpha,
-    int n_real
+    int32_t n_real
  ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int n_cmplx = nx * ny * (nz/2 + 1);
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t n_cmplx = nx * ny * (nz/2 + 1);
     if (idx >= n_cmplx) return;
 
-    int nxny = nx*ny;
-    int iz = idx / nxny;          // 0 .. nz/2
-    int rem = idx - iz * nxny;
-    int iy = rem / nx;            // 0 .. ny-1
-    int ix = rem - iy * nx;         // 0 .. nx-1
+    int32_t nxny = nx*ny;
+    int32_t iz = idx / nxny;          // 0 .. nz/2
+    int32_t rem = idx - iz * nxny;
+    int32_t iy = rem / nx;            // 0 .. ny-1
+    int32_t ix = rem - iy * nx;         // 0 .. nx-1
 
     float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
 
@@ -170,15 +170,15 @@ void gather_forces_to_atoms(
     const float*  ez,
     const float*  q,
     float3*       out_f,
-    int n_atoms,
-    int nx,
-    int ny,
-    int nz,
+    int32_t n_atoms,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
     float lx,
     float ly,
     float lz
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_atoms) return;
 
     float3 r = pos[i];
@@ -186,9 +186,9 @@ void gather_forces_to_atoms(
     float sy = r.y / ly * ny;
     float sz = r.z / lz * nz;
 
-    int ix0 = __float2int_rd(sx) - 1;
-    int iy0 = __float2int_rd(sy) - 1;
-    int iz0 = __float2int_rd(sz) - 1;
+    int32_t ix0 = __float2int_rd(sx) - 1;
+    int32_t iy0 = __float2int_rd(sy) - 1;
+    int32_t iz0 = __float2int_rd(sz) - 1;
 
     float u = sx - floorf(sx);
     float v = sy - floorf(sy);
@@ -199,17 +199,17 @@ void gather_forces_to_atoms(
     float w2=w*w, w3=w2*w, wm=1.f-w; float wz[4] = {(wm*wm*wm)/6.f,(3.f*w3-6.f*w2+4.f)/6.f,(-3.f*w3+3.f*w2+3.f*w+1.f)/6.f,w3/6.f};
 
     float Exi=0.f, Eyi=0.f, Ezi=0.f;
-    for (int a=0; a<4; a++){
-        int ix = wrap(ix0 + a, nx);
+    for (int32_t a=0; a<4; a++){
+        int32_t ix = wrap(ix0 + a, nx);
         float wxa = wx[a];
 
-        for (int b=0; b<4; b++){
-            int iy = wrap(iy0 + b, ny);
+        for (int32_t b=0; b<4; b++){
+            int32_t iy = wrap(iy0 + b, ny);
             float wxy = wxa * wy[b];
             size_t base = size_t(iy)*nx + ix;
 
-            for (int c=0; c<4; c++){
-                int iz = wrap(iz0 + c, nz);
+            for (int32_t c=0; c<4; c++){
+                int32_t iz = wrap(iz0 + c, nz);
                 float wfac = wxy * wz[c];
                 size_t idx = size_t(iz)*nx*ny + base;
 
@@ -235,29 +235,29 @@ void energy_half_spectrum(
     const float* bx,
     const float* by,
     const float* bz,
-    int nx,
-    int ny,
-    int nz,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
     float vol,
     float alpha,
     double* out_partial
 ) {
     __shared__ double ssum[256];
-    int tid = threadIdx.x;
+    int32_t tid = threadIdx.x;
     double acc = 0.0;
 
-    int nxy = nx*ny;
-    int n_cmplx = nxy*(nz/2 + 1);
+    int32_t nxy = nx*ny;
+    int32_t n_cmplx = nxy*(nz/2 + 1);
 
     // CUFFT normalization for |rho_k|^2
-    int N = nx*ny*nz;
+    int32_t N = nx * ny * nz;
     double invN2 = 1.0 / (double(N) * double(N));
 
-    for (int idx = blockIdx.x*blockDim.x + tid; idx < n_cmplx; idx += gridDim.x*blockDim.x) {
-        int iz = idx / nxy;
-        int rem = idx - iz*nxy;
-        int iy = rem / nx;
-        int ix = rem - iy*nx;
+    for (int32_t idx = blockIdx.x*blockDim.x + tid; idx < n_cmplx; idx += gridDim.x*blockDim.x) {
+        int32_t iz = idx / nxy;
+        int32_t rem = idx - iz*nxy;
+        int32_t iy = rem / nx;
+        int32_t ix = rem - iy*nx;
 
         float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
         float k2  = fmaf(kxv,kxv, fmaf(kyv,kyv, kzv*kzv));
@@ -271,12 +271,12 @@ void energy_half_spectrum(
         float a = rho_k[idx].x, b = rho_k[idx].y;
         double mag2 = double(a)*a + double(b)*b;
 
-        int twice = (iz==0 || ((nz%2)==0 && iz==(nz/2))) ? 1 : 2;
+        int32_t twice = (iz==0 || ((nz%2)==0 && iz==(nz/2))) ? 1 : 2;
         acc += 0.5 * double(twice) * double(ghat) * (mag2 * invN2);
     }
     ssum[tid] = acc;
     __syncthreads();
-    for (int s = blockDim.x/2; s>0; s>>=1) {
+    for (int32_t s = blockDim.x/2; s>0; s>>=1) {
         if (tid < s) ssum[tid] += ssum[tid+s];
         __syncthreads();
     }
@@ -286,7 +286,7 @@ void energy_half_spectrum(
 
 // A utility kernel.
 extern "C" __global__
-void scale_vec(float* x, int n, float s) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+void scale_vec(float* x, int32_t n, float s) {
+    int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= s;
 }

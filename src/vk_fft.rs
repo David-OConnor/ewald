@@ -36,14 +36,10 @@ impl VkContext {
 
 unsafe extern "C" {
     // plan lifecycle
-    pub fn make_plan_r2c_c2r_many(ctx: *mut c_void, nx: i32, ny: i32, nz: i32) -> *mut c_void;
+    pub fn make_plan(ctx: *mut c_void, nx: i32, ny: i32, nz: i32) -> *mut c_void;
     pub fn destroy_plan(plan: *mut c_void);
 
-    pub fn exec_inverse_c2r(
-        plan: *mut c_void,
-        complex_in_dev: *mut c_void,
-        real_out_dev: *mut c_void,
-    );
+    pub fn exec_inverse(plan: *mut c_void, complex_in_dev: *mut c_void, real_out_dev: *mut c_void);
 
     // (optional) context lifecycle if you want to create it here
     pub fn vk_make_context_default() -> *mut c_void;
@@ -62,5 +58,5 @@ impl PmeRecip {
 pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>) -> *mut c_void {
     let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
 
-    unsafe { make_plan_r2c_c2r_many(ctx.handle, nx, ny, nz) }
+    unsafe { make_plan(ctx.handle, nx, ny, nz) }
 }
