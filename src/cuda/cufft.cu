@@ -39,26 +39,20 @@ void* make_plan(int nx, int ny, int nz, void* cu_stream) {
     w->n_cmplx = size_t(nx)*ny*(nz/2 + 1);
     w->stream = reinterpret_cast<cudaStream_t>(cu_stream);
 
-    CUFFT_CHECK(cufftPlan3d(&w->plan_r2c, nx, ny, nz, CUFFT_R2C));
+    int n[1] = { nx };
+    int inembed[1] = { nx };
+    int onembed[1] = { nx/2 + 1 };
+    int istride = 1, ostride = 1;
+    int idist = nx;               // distance between rows (x-rows)
+    int odist = nx/2 + 1;         // distance between output rows
+    int batch = ny * nz;
+
+    CUFFT_CHECK(cufftPlanMany(&w->plan_r2c, 1, n,
+                              inembed, istride, idist,
+                              onembed, ostride, odist,
+                              CUFFT_R2C, batch));
     CUFFT_CHECK(cufftSetStream(w->plan_r2c, w->stream));
 
-    CUFFT_CHECK(cufftPlan3d(&w->plan_c2r, nx, ny, nz, CUFFT_C2R));
-    CUFFT_CHECK(cufftSetStream(w->plan_c2r, w->stream));
-
-//     // PlanMany for 3 fields back to real grids
-//     int n[3] = {nx, ny, nz};
-//     int inembed[3]  = {nx, ny, nz/2 + 1};
-//     int onembed[3]  = {nx, ny, nz};
-//     int istride = 1, ostride = 1;
-//     int idist = nx*ny*(nz/2 + 1);
-//     int odist = nx*ny*nz;
-//     int batch = 3;
-//
-//     CUFFT_CHECK(cufftPlanMany(&w->plan_c2r_many, 3, n,
-//                               inembed, istride, idist,
-//                               onembed, ostride, odist,
-//                               CUFFT_C2R, batch));
-//     CUFFT_CHECK(cufftSetStream(w->plan_c2r_many, w->stream));
     return w;
 }
 
@@ -102,4 +96,3 @@ void exec_inverse(
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r, eyk, ey));
     CUFFT_CHECK(cufftExecC2R(w->plan_c2r, ezk, ez));
 }
-
