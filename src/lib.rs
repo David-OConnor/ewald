@@ -43,10 +43,9 @@ use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
+use crate::fft::{fft3_c2r, fft3_r2c};
 #[cfg(feature = "cuda")]
 use crate::gpu_shared::{GpuTables, Kernels};
-
-use crate::fft::{fft3_c2r, fft3_r2c};
 
 #[cfg(feature = "cuda")]
 const PTX: &str = include_str!("../ewald.ptx");
@@ -63,6 +62,7 @@ const SPLINE_ORDER: usize = 4;
 type Complex_ = Complex<f32>;
 
 /// Initialize this once for the application, or once per step.
+/// Note:
 pub struct PmeRecip {
     /// Simultatoin box-lengths in real space.
     box_dims: (f32, f32, f32),
@@ -98,21 +98,21 @@ pub struct PmeRecip {
 impl PmeRecip {
     pub fn new(
         #[cfg(feature = "cuda")] stream: &Arc<CudaStream>,
-        n: (usize, usize, usize),
+        plan_dims: (usize, usize, usize),
         l: (f32, f32, f32),
         alpha: f32,
     ) -> Self {
-        assert!(n.0 >= 4 && n.1 >= 4 && n.2 >= 4);
+        assert!(plan_dims.0 >= 4 && plan_dims.1 >= 4 && plan_dims.2 >= 4);
 
         let vol = l.0 * l.1 * l.2;
 
-        let kx = make_k_array(n.0, l.0);
-        let ky = make_k_array(n.1, l.1);
-        let kz = make_k_array(n.2, l.2);
+        let kx = make_k_array(plan_dims.0, l.0);
+        let ky = make_k_array(plan_dims.1, l.1);
+        let kz = make_k_array(plan_dims.2, l.2);
 
-        let bmod2_x = spline_bmod2_1d(n.0, SPLINE_ORDER);
-        let bmod2_y = spline_bmod2_1d(n.1, SPLINE_ORDER);
-        let bmod2_z = spline_bmod2_1d(n.2, SPLINE_ORDER);
+        let bmod2_x = spline_bmod2_1d(plan_dims.0, SPLINE_ORDER);
+        let bmod2_y = spline_bmod2_1d(plan_dims.1, SPLINE_ORDER);
+        let bmod2_z = spline_bmod2_1d(plan_dims.2, SPLINE_ORDER);
 
         #[cfg(feature = "cuda")]
         let (kernels, gpu_tables) = {
@@ -122,14 +122,12 @@ impl PmeRecip {
 
                 let kernel_spread = module.load_function("spread_charges").unwrap();
                 let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
-                let kernel_scale = module.load_function("scale_vec").unwrap();
                 let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
                 let kernel_half_spectrum = module.load_function("energy_half_spectrum").unwrap();
 
                 Kernels {
                     kernel_spread,
                     kernel_ghat,
-                    kernel_scale,
                     kernel_gather,
                     kernel_half_spectrum,
                 }
@@ -146,19 +144,19 @@ impl PmeRecip {
         };
 
         #[cfg(feature = "cufft")]
-        let planner_gpu = cufft::create_gpu_plan(n, stream);
+        let planner_gpu = cufft::create_gpu_plan(plan_dims, stream);
 
         #[cfg(feature = "vkfft")]
         let vk_ctx = Arc::new(vk_fft::VkContext::default());
         #[cfg(feature = "vkfft")]
-        let planner_gpu = vk_fft::create_gpu_plan(n, &vk_ctx);
+        let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx);
 
         // Note: planner_gpu and gpu_tables will be null/None until the first run. We
         // handle it this way since the forces fns have access to the stream or Context,
         // but this construct doens't, if we keep a unified constructor.
         Self {
             box_dims: l,
-            plan_dims: n,
+            plan_dims,
             vol,
             alpha,
             kx,
@@ -179,12 +177,12 @@ impl PmeRecip {
         }
     }
 
-    /// CPU charge spreading.
+    /// CPU charge spreading. Z as the fast/contiguous axis.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
         let (nx, ny, nz) = self.plan_dims;
         let (lx, ly, lz) = self.box_dims;
 
-        let nxny = nx * ny;
+        let nynz = ny * nz; // Z-fast layout helper
 
         for (r, &qi) in pos.iter().zip(q.iter()) {
             let sx = r.x / lx * nx as f32;
@@ -203,11 +201,12 @@ impl PmeRecip {
                     let iy = wrap(iy0 + b as isize, ny);
                     let wxy = wxa * wy[b];
 
-                    let base = iy * nx + ix;
+                    // Z-fast base for this (ix, iy)
+                    let base = ix * nynz + iy * nz;
 
                     for c in 0..SPLINE_ORDER {
                         let iz = wrap(iz0 + c as isize, nz);
-                        let idx = iz * nxny + base;
+                        let idx = base + iz; // contiguous over z
                         rho[idx] += qi * wxy * wz[c];
                     }
                 }
@@ -224,57 +223,100 @@ impl PmeRecip {
         let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
+        // Z is the fast dimension; keep this consistent with the CPU FFT setup, and
+        // cuFFT; note that this is cuFFT's default layout.
         let n_real = nx * ny * nz;
-        let nxc = nx / 2 + 1;
-        let n_k = nxc * ny * nz;
+        let nzc = nz / 2 + 1;
+        let n_k = nx * ny * nzc;
 
         // Charge density.
-        // let mut rho_real = vec![Complex_::new(0.0, 0.0); n_real];
         let mut rho_real = vec![0.; n_real];
 
         self.spread_charges(posits, q, &mut rho_real);
 
-        for i in 0..10 {
-            println!("Q spread CPU pre fwd FFT: {:?}", rho_real[i])
-        }
+        // for i in 0..10 {
+        //     println!("rho CPU pre fwd FFT: {:?}", rho_real[i])
+        // }
 
-        // Convert spread charges to K space (Hermitian packed along X)
+        // Convert spread charges to K space
         let mut rho = fft3_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
 
-        // // Convert the spread charges to K space. They will be complex, and in the frequency domain.
-        // fft3_inplace(&mut rho_real, self.plan_dims, &mut self.planner, true);
+        // for i in 220..230 {
+        //     println!("rho CPU post fwd FFT: {:?}", rho[i])
+        // }
 
-        for i in 0..10 {
-            println!("Q spread post post fwd FFT: {:?}", rho[i])
-        }
+        // eAk are per-dimension phase factors.
+        // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
+        let mut exk = vec![Complex::new(0.0, 0.0); n_k];
+        let mut eyk = vec![Complex::new(0.0, 0.0); n_k];
+        let mut ezk = vec![Complex::new(0.0, 0.0); n_k];
 
+        let mut energy = self.apply_ghat_and_grad(&rho, &mut exk, &mut eyk, &mut ezk, ny, nzc);
+
+        energy += self_energy(q, self.alpha);
+
+        // println!("\n");
+        // println!("Energy CPU: {:?}", energy);
+        //
+        // for i in 220..230 {
+        //     println!("exk post ghat: {:?}", exk[i])
+        // }
+        // for i in 220..230 {
+        //     println!("eyk post ghat: {:?}", eyk[i])
+        // }
+        // println!("\n");
+
+        // Inverse FFT to real-space E grids (C2R)
+        let ex = fft3_c2r(&mut exk, self.plan_dims, &mut self.planner);
+        let ey = fft3_c2r(&mut eyk, self.plan_dims, &mut self.planner);
+        let ez = fft3_c2r(&mut ezk, self.plan_dims, &mut self.planner);
+
+        // for i in 220..230 {
+        //     println!("exk CPU post inv FFT: {:?}", ex[i])
+        // }
+        // println!("\n");
+        // for i in 220..230 {
+        //     println!("eyk CPU post inv FFT: {:?}", ey[i])
+        // }
+
+        // todo: QC the minus sign?
+        let f = gather_forces_to_atoms(posits, q, &ex, &ey, &ez, self.plan_dims, self.box_dims);
+
+        (f, energy as f32)
+    }
+
+    /// Apply ĝ(k) – multiply each Fourier mode of the charge density by the Ewald/PME
+    /// influence function to get the potential in k-space. Take the gradient of the potential in
+    /// Fourier space to get the electric field.
+    ///
+    /// Also computes the half-spectrum energy.
+    fn apply_ghat_and_grad(
+        &self,
+        rho: &[Complex_],
+        exk: &mut [Complex_],
+        eyk: &mut [Complex_],
+        ezk: &mut [Complex_],
+        ny: usize,
+        nzc: usize,
+    ) -> f64 {
         // Hoist shared refs so the parallel closure doesn't borrow &mut self
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
         let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
         let (vol, alpha) = (self.vol, self.alpha);
 
-        // eAk are per-dimension phase factors.
-        // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        // let mut exk = vec![Complex::new(0.0, 0.0); n_real];
-        // let mut eyk = vec![Complex::new(0.0, 0.0); n_real];
-        // let mut ezk = vec![Complex::new(0.0, 0.0); n_real];
-        let mut exk = vec![Complex::new(0.0, 0.0); n_k];
-        let mut eyk = vec![Complex::new(0.0, 0.0); n_k];
-        let mut ezk = vec![Complex::new(0.0, 0.0); n_k];
-
-        let mut energy: f64 = exk
-            .par_iter_mut()
+        exk.par_iter_mut()
             .zip(eyk.par_iter_mut())
             .zip(ezk.par_iter_mut())
             .enumerate()
             .map(|(idx, ((ex, ey), ez))| {
-                let ix = idx % nx;
-                let iy = (idx / nx) % ny;
-                let iz = idx / (nx * ny);
+                // Z-fast, Y-middle, X-slowest
+                let izc = idx % nzc;
+                let iy = (idx / nzc) % ny;
+                let ix = idx / (nzc * ny);
 
                 let kxv = kx[ix];
                 let kyv = ky[iy];
-                let kzv = kz[iz];
+                let kzv = kz[izc];
 
                 let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
 
@@ -285,7 +327,7 @@ impl PmeRecip {
                     return 0.;
                 }
 
-                let bmod2 = bx[ix] * by[iy] * bz[iz];
+                let bmod2 = bx[ix] * by[iy] * bz[izc];
                 if bmod2 <= 1e-10 {
                     *ex = Complex::new(0.0, 0.0);
                     *ey = Complex::new(0.0, 0.0);
@@ -311,72 +353,7 @@ impl PmeRecip {
 
                 0.5 * energy
             })
-            .sum();
-
-        let self_energy: f64 = -(self.alpha / SQRT_PI) as f64
-            * q.iter().map(|&qi| (qi as f64) * (qi as f64)).sum::<f64>();
-        energy += self_energy;
-
-        // // Note: These FFTs are the biggest time bottleneck.
-        // // Inverse FFT to real-space E grids
-        // fft3_inplace(&mut exk, self.plan_dims, &mut self.planner, false);
-        // fft3_inplace(&mut eyk, self.plan_dims, &mut self.planner, false);
-        // fft3_inplace(&mut ezk, self.plan_dims, &mut self.planner, false);
-
-        // Inverse FFT to real-space E grids (C2R)
-        let mut ex = fft3_c2r(&mut exk, self.plan_dims, &mut self.planner);
-        let mut ey = fft3_c2r(&mut eyk, self.plan_dims, &mut self.planner);
-        let mut ez = fft3_c2r(&mut ezk, self.plan_dims, &mut self.planner);
-
-        // Interpolate E back to particles with the same B-spline weights; F = q E
-
-        let f = posits
-            .par_iter()
-            .enumerate()
-            .map(|(i, &r)| {
-                let (ix0, wx) = bspline4_weights(r.x / lx * nx as f32);
-                let (iy0, wy) = bspline4_weights(r.y / ly * ny as f32);
-                let (iz0, wz) = bspline4_weights(r.z / lz * nz as f32);
-
-                let mut ex_v = 0.0f64;
-                let mut ey_v = 0.0f64;
-                let mut ez_v = 0.0f64;
-
-                for a in 0..4 {
-                    let ix = wrap(ix0 + a as isize, nx);
-                    let wxa = wx[a];
-
-                    for b in 0..4 {
-                        let iy = wrap(iy0 + b as isize, ny);
-                        let wyb = wy[b];
-                        let wxy = wxa * wyb;
-
-                        for c in 0..4 {
-                            let iz = wrap(iz0 + c as isize, nz);
-                            let w = (wxy * wz[c]) as f64;
-                            let idx = iz * (nx * ny) + iy * nx + ix;
-
-                            ex_v = w.mul_add(ex[idx] as f64, ex_v);
-                            ey_v = w.mul_add(ey[idx] as f64, ey_v);
-                            ez_v = w.mul_add(ez[idx] as f64, ez_v);
-                        }
-                    }
-                }
-
-                let qi = q[i] as f64;
-                Vec3 {
-                    x: (ex_v * qi) as f32,
-                    y: (ey_v * qi) as f32,
-                    z: (ez_v * qi) as f32,
-                }
-            })
-            .collect();
-
-        // Interpolate φ to particles and compute ½ Σ q_i φ_i
-        // let phi_vals = self.interpolate_scalar(posits, &phi_k);
-        // let energy = 0.5 * q.iter().zip(phi_vals.iter()).map(|(qi, phi)| qi * phi).sum::<f64>();
-
-        (f, energy as f32)
+            .sum()
     }
 }
 
@@ -449,7 +426,6 @@ fn wrap(i: isize, n: usize) -> usize {
     }
     v as usize
 }
-
 
 ///  Ideally, use a combined GPU kernel with Lennard Jones, or a SIMD variant, instead of this.
 ///  We use this for short-range Coulomb forces on the CPU, as part of SPME.
@@ -601,4 +577,111 @@ pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3
         * (erf(ar as f64) as f32 * inv_r2 - (alpha * TWO_INV_SQRT_PI) * (-ar * ar).exp() * inv_r);
     // let fmag = qfac * (mul_add(erf(ar as f64) as f32, inv_r2,  -(alpha * TWO_INV_SQRT_PI)) * (-ar * ar).exp() * inv_r);
     dir * fmag
+}
+
+/// Used on both CPU and GPU paths
+fn self_energy(q: &[f32], alpha: f32) -> f64 {
+    -(alpha / SQRT_PI) as f64 * q.iter().map(|&qi| (qi as f64) * (qi as f64)).sum::<f64>()
+}
+
+/// Interpolate E back to particles with the same B-spline weights; F = q E
+fn gather_forces_to_atoms(
+    posits: &[Vec3],
+    q: &[f32],
+    ex: &[f32],
+    ey: &[f32],
+    ez: &[f32],
+    plan_dims: (usize, usize, usize),
+    box_dims: (f32, f32, f32),
+) -> Vec<Vec3> {
+    let (nx, ny, nz) = plan_dims;
+    let (lx, ly, lz) = box_dims;
+
+    posits
+        .par_iter()
+        .enumerate()
+        .map(|(i, &r)| {
+            let (ix0, wx) = bspline4_weights(r.x / lx * nx as f32);
+            let (iy0, wy) = bspline4_weights(r.y / ly * ny as f32);
+            let (iz0, wz) = bspline4_weights(r.z / lz * nz as f32);
+
+            let mut ex_v = 0.0f64;
+            let mut ey_v = 0.0f64;
+            let mut ez_v = 0.0f64;
+
+            for a in 0..4 {
+                let ix = wrap(ix0 + a as isize, nx);
+                let wxa = wx[a];
+
+                for b in 0..4 {
+                    let iy = wrap(iy0 + b as isize, ny);
+                    let wyb = wy[b];
+                    let wxy = wxa * wyb;
+
+                    for c in 0..4 {
+                        let iz = wrap(iz0 + c as isize, nz);
+                        let w = (wxy * wz[c]) as f64;
+
+                        // Z-fast real layout
+                        let idx = ix * (ny * nz) + iy * nz + iz;
+
+                        ex_v = w.mul_add(ex[idx] as f64, ex_v);
+                        ey_v = w.mul_add(ey[idx] as f64, ey_v);
+                        ez_v = w.mul_add(ez[idx] as f64, ez_v);
+                    }
+                }
+            }
+
+            let qi = q[i] as f64;
+
+            // todo: QC the - sign.
+            -Vec3 {
+                x: (ex_v * qi) as f32,
+                y: (ey_v * qi) as f32,
+                z: (ez_v * qi) as f32,
+            }
+        })
+        .collect()
+}
+
+/// A utility fn. todo: QC this.
+fn next_planner_n(mut n: usize) -> usize {
+    fn good(mut x: usize) -> bool {
+        for p in [2, 3, 5, 7] {
+            while x.is_multiple_of(p) {
+                x /= p;
+            }
+        }
+        x == 1
+    }
+    if n < 2 {
+        n = 2;
+    }
+    while !good(n) {
+        n += 1;
+    }
+    n
+}
+
+/// A utility function to get the (nx, ny, nz) tuple of plan dimensions based
+/// on grid dimensions, and mesh spacing. A mesh spacing of 1Å is a good starting point.
+/// Pass this into the `PmeRecip::new()` constructor, or set these values
+/// up with some other approach.
+pub fn get_grid_n(l: (f32, f32, f32), mesh_spacing: f32) -> (usize, usize, usize) {
+    let (lx, ly, lz) = l;
+
+    let nx0 = (lx / mesh_spacing).round().max(SPLINE_ORDER as f32) as usize;
+    let ny0 = (ly / mesh_spacing).round().max(SPLINE_ORDER as f32) as usize;
+    let nz0 = (lz / mesh_spacing).round().max(SPLINE_ORDER as f32) as usize;
+
+    let nx = next_planner_n(nx0);
+    let ny = next_planner_n(ny0);
+    let mut nz = next_planner_n(nz0);
+
+    // We use this because we use Z as the fast (contiguous) axis.
+    if !nz.is_multiple_of(2) {
+        nz = next_planner_n(nz + 1);
+    }
+
+    (nx, ny, nz)
 }

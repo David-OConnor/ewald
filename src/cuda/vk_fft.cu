@@ -65,50 +65,80 @@ void vk_destroy_context(void* ctx_) {
 
 // Set up a plan for a 3D FFT using real-to-complex, and complex-to-real transforms.
 void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
- VkContext* c = (VkContext*)ctx_;
+    VkContext* c = (VkContext*)ctx_;
     VkFftPlan* p = (VkFftPlan*)calloc(1, sizeof(VkFftPlan));
+
+    // 1) ASSIGN THESE FIRST
     p->Nx = (uint64_t)nx;
     p->Ny = (uint64_t)ny;
     p->Nz = (uint64_t)nz;
+
+    uint64_t Nz  = p->Nz;
+    uint64_t Ny  = p->Ny;
+    uint64_t Nx  = p->Nx;
+    uint64_t nzc = Nz/2 + 1;
+
+    size_t s_r = sizeof(float);      // real
+    size_t s_c = sizeof(float2);     // complex (interleaved)
 
     // -------------------------------
     // Forward (R2C) configuration
     // -------------------------------
     memset(&p->cfg_r2c, 0, sizeof(p->cfg_r2c));
-
     p->cfg_r2c.FFTdim = 3;
-    p->cfg_r2c.size[0] = p->Nx;
-    p->cfg_r2c.size[1] = p->Ny;
-    p->cfg_r2c.size[2] = p->Nz;
+
+    // 2) TELL VkFFT THE LOGICAL SIZES (Z-fast: [Nz, Ny, Nx])
+    p->cfg_r2c.size[0] = Nz;   // fast (W)  <- Z
+    p->cfg_r2c.size[1] = Ny;   //           <- Y
+    p->cfg_r2c.size[2] = Nx;   //           <- X
+
+    // Real input strides (BYTES), Z-fast: [1, Nz, Ny*Nz]
+    p->cfg_r2c.inputBufferStride[0] = (Ny * Nz) * s_r;  // step 1 in X = jump an entire YZ plane
+    p->cfg_r2c.inputBufferStride[1] = (Nz)      * s_r;  // step 1 in Y = jump one Z-line
+    p->cfg_r2c.inputBufferStride[2] = (1)       * s_r;  // step 1 in Z = move to next element
+
+    // Complex output [Nx, Ny, nzc] with Z' contiguous:
+    p->cfg_r2c.outputBufferStride[0] = (Ny * nzc) * s_c; // step 1 in X
+    p->cfg_r2c.outputBufferStride[1] = (nzc)      * s_c; // step 1 in Y
+    p->cfg_r2c.outputBufferStride[2] = (1)        * s_c; // step 1 in Z'
+
+    p->cfg_r2c.disableMergeSequencesR2C = 1;
+
+    p->cfg_r2c.performR2C = 1;
+    p->cfg_r2c.normalize  = 0;
+    p->cfg_r2c.numberBatches = 1;
 
     p->cfg_r2c.device = &c->dev;
     p->cfg_r2c.stream = &c->stream;
     p->cfg_r2c.num_streams = 1;
 
-    p->cfg_r2c.performR2C = 1;
-    p->cfg_r2c.normalize  = 0;
-    p->cfg_r2c.isInputFormatted  = 0;
-    p->cfg_r2c.isOutputFormatted = 0;
-    p->cfg_r2c.numberBatches = 1;
-    p->cfg_r2c.printMemoryLayout = 1;
-
     // -------------------------------
     // Inverse (C2R) configuration
     // -------------------------------
     memset(&p->cfg_c2r, 0, sizeof(p->cfg_c2r));
-    p->cfg_c2r.FFTdim = 4;
-    p->cfg_c2r.size[0] = 3; // batch axis: Ex,Ey,Ez
-    p->cfg_c2r.size[1] = p->Nx;
-    p->cfg_c2r.size[2] = p->Ny;
-    p->cfg_c2r.size[3] = p->Nz;
+    p->cfg_c2r.FFTdim = 3;
 
-    p->cfg_c2r.omitDimension[0] = 1; // do not FFT over batch
-    p->cfg_c2r.performR2C = 0;
-    p->cfg_c2r.normalize = 0; // cuFFT inverse is unnormalized
+    // 2) LOGICAL SIZES AGAIN (Z-fast)
+    p->cfg_c2r.size[0] = Nz;   // fast (W)  <- Z
+    p->cfg_c2r.size[1] = Ny;   //           <- Y
+    p->cfg_c2r.size[2] = Nx;   //           <- X
+
+    p->cfg_c2r.inputBufferStride[0] = 1      * s_c;          // Z' step
+    p->cfg_c2r.inputBufferStride[1] = nzc    * s_c;          // Y step
+    p->cfg_c2r.inputBufferStride[2] = Ny*nzc * s_c;          // X step
+
+    // Real output full strides (BYTES), Z-fast
+    p->cfg_c2r.outputBufferStride[0] = 1      * s_r;         // Z step
+    p->cfg_c2r.outputBufferStride[1] = Nz     * s_r;         // Y step
+    p->cfg_c2r.outputBufferStride[2] = Ny*Nz  * s_r;         // X step
+
+    p->cfg_c2r.performR2C = 0;    // C2R
+    p->cfg_c2r.normalize  = 0;    // match cuFFT (unnormalized)
+    p->cfg_c2r.numberBatches = 1; // one field per call
+
     p->cfg_c2r.device = &c->dev;
     p->cfg_c2r.stream = &c->stream;
     p->cfg_c2r.num_streams = 1;
-    p->cfg_c2r.numberBatches = 3;
 
     // -------------------------------
     // Initialize VkFFT plans
@@ -117,13 +147,11 @@ void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
         free(p);
         return NULL;
     }
-
     if (initializeVkFFT(&p->app_c2r, p->cfg_c2r) != VKFFT_SUCCESS) {
         deleteVkFFT(&p->app_r2c);
         free(p);
         return NULL;
     }
-
     return p;
 }
 

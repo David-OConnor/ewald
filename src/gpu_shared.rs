@@ -7,16 +7,16 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfi
 use lin_alg::f32::{Vec3, vec3s_to_dev};
 use rustfft::num_complex::Complex;
 
-use crate::PmeRecip;
 #[cfg(feature = "cufft")]
 use crate::cufft;
 #[cfg(feature = "vkfft")]
 use crate::vk_fft;
+use crate::{PmeRecip, SQRT_PI, self_energy};
 
 pub(crate) struct Kernels {
     pub kernel_spread: CudaFunction,
     pub kernel_ghat: CudaFunction,
-    pub kernel_scale: CudaFunction,
+    // pub kernel_scale: CudaFunction,
     pub kernel_gather: CudaFunction,
     pub kernel_half_spectrum: CudaFunction,
 }
@@ -61,7 +61,9 @@ impl PmeRecip {
         let (nx, ny, nz) = self.plan_dims;
 
         let n_real = nx * ny * nz;
-        let n_cplx = nx * ny * (nz / 2 + 1); // half-spectrum length
+        let nzc = nz / 2 + 1;
+        let n_cplx = nx * ny * nzc;
+
         let complex_len = n_cplx * 2; // (re,im) interleaved
 
         // ---------- Allocate arrays on the GPU
@@ -91,13 +93,12 @@ impl PmeRecip {
             posits.len() as u32,
         );
 
-        // // todo temp
-        {
-            let rho_cpu = stream.memcpy_dtov(&rho_real_dev).unwrap();
-            for i in 0..10 {
-                println!("Q spread GPU pre fwd FFT (re): {:?}", rho_cpu[i])
-            }
-        }
+        // {
+        //     let rho_cpu = stream.memcpy_dtov(&rho_real_dev).unwrap();
+        //     for i in 0..10 {
+        //         println!("rho GPU pre fwd FFT (re): {:?}", rho_cpu[i])
+        //     }
+        // }
 
         // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
@@ -108,22 +109,20 @@ impl PmeRecip {
             );
         }
 
-        {
-            let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
-            let mut rho_dbg = Vec::new();
-            for i in 0..complex_len / 2 {
-                rho_dbg.push(Complex::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
-            }
-            for i in 0..10 {
-                println!("Q spread GPU post fwd FFT: {:?}", rho_dbg[i])
-            }
-        }
+        // {
+        //     let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
+        //     let mut rho_dbg = Vec::new();
+        //     for i in 0..complex_len / 2 {
+        //         rho_dbg.push(Complex::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
+        //     }
+        //
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("rho GPU post fwd FFT: {:?}", rho_dbg[i])
+        //     }
+        // }
 
         // todo: Pre-allocate these instead of every step?
-        let mut ex_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut ey_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut ez_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-
         // Contiguous complex buffer: [exk | eyk | ezk]
         // let ekx_eky_ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
         let mut exk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
@@ -139,7 +138,7 @@ impl PmeRecip {
         apply_ghat_and_grad(
             stream,
             &self.kernels.kernel_ghat,
-            &mut rho_dev,
+            &rho_dev,
             &mut exk_dev,
             &mut eyk_dev,
             &mut ezk_dev,
@@ -148,6 +147,54 @@ impl PmeRecip {
             self.vol,
             self.alpha,
         );
+
+        // {
+        //     let exk = stream.memcpy_dtov(&exk_dev).unwrap();
+        //     let eyk = stream.memcpy_dtov(&eyk_dev).unwrap();
+        //     let mut exk_dbg = Vec::new();
+        //     let mut eyk_dbg = Vec::new();
+        //
+        //     for i in 0..complex_len / 2 {
+        //         exk_dbg.push(Complex::new(exk[2 * i], exk[2 * i + 1]));
+        //         eyk_dbg.push(Complex::new(eyk[2 * i], eyk[2 * i + 1]));
+        //     }
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("exk GPU post GHAT: {:?}", exk_dbg[i]);
+        //     }
+        //     println!("\n");
+        //     // for i in 220..230 {
+        //     //     println!("eyk GPU post GHAT: {:?}", eyk_dbg[i]);
+        //     // }
+        // }
+
+        // todo: Qc this! Not sure what it should be.
+        let mut out_partial_gpu: CudaSlice<f64> = stream.alloc_zeros(n_cplx).unwrap();
+
+        energy_half_spectrum(
+            stream,
+            &self.kernels.kernel_half_spectrum,
+            &mut rho_dev,
+            &mut out_partial_gpu,
+            &self.gpu_tables,
+            self.plan_dims,
+            self.vol,
+            self.alpha,
+        );
+
+        let mut energy: f64 = stream
+            .memcpy_dtov(&out_partial_gpu)
+            .unwrap()
+            .into_iter()
+            .sum();
+
+        let energy = (energy + self_energy(q, self.alpha)) as f32;
+
+        // println!("\n Energy GPU: {:?}", energy);
+
+        let ex_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let ey_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+        let ez_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
 
         let ex_ptr = cuda_slice_to_ptr_mut(&ex_dev, stream);
         let ey_ptr = cuda_slice_to_ptr_mut(&ey_dev, stream);
@@ -165,11 +212,33 @@ impl PmeRecip {
             );
         }
 
-        let inv_n = 1.0f32 / (n_real as f32);
+        // {
+        //     let ex_ = stream.memcpy_dtov(&ex_dev).unwrap();
+        //     let ey_ = stream.memcpy_dtov(&ey_dev).unwrap();
+        //
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("exk GPU post inv FFT: {:?}", ex_[i]);
+        //     }
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("eyk GPU post inv FFT: {:?}", ey_[i]);
+        //     }
+        // }
 
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ex_dev, inv_n);
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ey_dev, inv_n);
-        scale_vec(stream, &self.kernels.kernel_scale, &mut ez_dev, inv_n);
+        // {
+        //     let ex_ = stream.memcpy_dtov(&ex_dev).unwrap();
+        //     let ey_ = stream.memcpy_dtov(&ey_dev).unwrap();
+        //
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("exk GPU post inv FFT and scale: {:?}", ex_[i]);
+        //     }
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("eyk GPU post inv FFT and scale: {:?}", ey_[i]);
+        //     }
+        // }
 
         let n_atoms = posits.len();
         let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * n_atoms).unwrap();
@@ -187,36 +256,19 @@ impl PmeRecip {
             self.box_dims,
         );
 
-        // todo: Qc this! Not sure what it should be.
-        let mut out_partial_gpu: CudaSlice<f64> = stream.alloc_zeros(n_cplx).unwrap();
-
-        energy_half_spectrum(
-            stream,
-            &self.kernels.kernel_half_spectrum,
-            &mut rho_dev,
-            &mut out_partial_gpu,
-            &self.gpu_tables,
-            self.plan_dims,
-            self.vol,
-            self.alpha,
-        );
-
-        let energy = stream
-            .memcpy_dtov(&out_partial_gpu)
-            .unwrap()
-            .into_iter()
-            .sum::<f64>() as f32;
-
         // D2H forces
         let f_host: Vec<f32> = stream.memcpy_dtov(&out_f_gpu).unwrap();
+
+        // todo: QC the - sign?
         let mut f = Vec::with_capacity(posits.len());
         for i in 0..posits.len() {
-            f.push(Vec3 {
+            f.push(-Vec3 {
                 x: f_host[i * 3 + 0],
                 y: f_host[i * 3 + 1],
                 z: f_host[i * 3 + 2],
             });
         }
+
 
         (f, energy)
     }
@@ -323,14 +375,17 @@ fn spread_charges(
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
 
+/// Apply ĝ(k) – multiply each Fourier mode of the charge density by the Ewald/PME
+/// influence function to get the potential in k-space. Take the gradient of the potential in
+/// Fourier space to get the electric field.
 /// Launch the GPU kernel;  Apply G(k) and gradient to get Exk/Eyk/Ezk
 fn apply_ghat_and_grad(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
-    rho_cplx_gpu: &mut CudaSlice<f32>,
-    ekx_gpu: &mut CudaSlice<f32>,
-    eky_gpu: &mut CudaSlice<f32>,
-    ekz_gpu: &mut CudaSlice<f32>,
+    rho_dev: &CudaSlice<f32>, // Cplx
+    ekx_dev: &mut CudaSlice<f32>,
+    eky_dev: &mut CudaSlice<f32>,
+    ekz_dev: &mut CudaSlice<f32>,
     tables: &GpuTables,
     plan_dims: (usize, usize, usize),
     vol: f32,
@@ -348,11 +403,11 @@ fn apply_ghat_and_grad(
     let cfg = launch_cfg(n as u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
-    launch_args.arg(rho_cplx_gpu);
+    launch_args.arg(rho_dev);
 
-    launch_args.arg(ekx_gpu);
-    launch_args.arg(eky_gpu);
-    launch_args.arg(ekz_gpu);
+    launch_args.arg(ekx_dev);
+    launch_args.arg(eky_dev);
+    launch_args.arg(ekz_dev);
 
     launch_args.arg(&tables.kx);
     launch_args.arg(&tables.ky);
@@ -469,18 +524,6 @@ fn gather_forces_to_atoms(
     launch_args.arg(&lz);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
-}
-
-fn scale_vec(stream: &Arc<CudaStream>, kernel: &CudaFunction, buf: &mut CudaSlice<f32>, s: f32) {
-    let n_i = buf.len() as i32;
-
-    let cfg = LaunchConfig::for_num_elems(n_i as u32);
-
-    let mut lb = stream.launch_builder(kernel);
-    lb.arg(buf);
-    lb.arg(&n_i);
-    lb.arg(&s);
-    unsafe { lb.launch(cfg) }.unwrap();
 }
 
 /// If we run `LaunchConfig::from_num_elems`, we get the error `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.

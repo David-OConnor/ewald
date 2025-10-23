@@ -78,11 +78,12 @@ void spread_charges(
                 int32_t iy = wrap(iy0 + b, ny);
                 float wxy = wxa * wy[b];
 
-                int32_t base = iy * nx + ix;
+                // Z-fast base for this (ix,iy) column
+                size_t base = (size_t)ix * (size_t)(ny * nz) + (size_t)iy * (size_t)nz;
 
                 for (int32_t c=0; c<4; c++) {
                     int32_t iz = wrap(iz0 + c, nz);
-                    size_t idx = size_t(iz) * nxny + base;
+                    size_t idx = base + (size_t)iz; // contiguous over z
                     atomicAdd(&rho[idx], qi * wxy * wz[c]);
                 }
             }
@@ -114,14 +115,15 @@ void apply_ghat_and_grad(
     int32_t n_real
  ) {
     int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t n_cmplx = nx * ny * (nz/2 + 1);
+
+    int32_t nzc = nz/2 + 1;
+    int32_t n_cmplx = nx * ny * nzc;
     if (idx >= n_cmplx) return;
 
-    int32_t nxny = nx*ny;
-    int32_t iz = idx / nxny;          // 0 .. nz/2
-    int32_t rem = idx - iz * nxny;
-    int32_t iy = rem / nx;            // 0 .. ny-1
-    int32_t ix = rem - iy * nx;         // 0 .. nx-1
+    // Z-fast decoding
+    int32_t iz = idx % nzc;                 // 0 .. nz/2
+    int32_t iy = (idx / nzc) % ny;          // 0 .. ny-1
+    int32_t ix =  idx / (nzc * ny);         // 0 .. nx-1
 
     float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
 
@@ -134,30 +136,36 @@ void apply_ghat_and_grad(
     const float TWO_TAU = 12.56637061435917295385f; // 4π
 
     float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) / (k2 * bmod2);
-//     ghat *= float(n_real);   // compensate the 1/N you apply after the inverse
 
+    // φ(k) = G(k) * ρ(k)
     float phi_k_real = rho[idx].x * ghat;
-    float phi_k_im = rho[idx].y * ghat;
+    float phi_k_im   = rho[idx].y * ghat;
 
-    // todo: Refactored; problem in a broken way.
-    exk[idx].x = kxv * phi_k_real;
-    exk[idx].y = kxv * phi_k_im;
+    // E(k) = i * k * φ(k)
+    // ex = (-kx * Im φ,  kx * Re φ)
+    // ey = (-ky * Im φ,  ky * Re φ)
+    // ez = (-kz * Im φ,  kz * Re φ)
+    exk[idx].x = -kxv * phi_k_im;
+    exk[idx].y =  kxv * phi_k_real;
 
-    eyk[idx].x = kyv * phi_k_real;
-    eyk[idx].y = kyv * phi_k_im;
+    eyk[idx].x = -kyv * phi_k_im;
+    eyk[idx].y =  kyv * phi_k_real;
 
-    ezk[idx].x = kzv * phi_k_real;
-    ezk[idx].y = kzv * phi_k_im;
+    ezk[idx].x = -kzv * phi_k_im;
+    ezk[idx].y =  kzv * phi_k_real;
 
-    // after computing a,b and setting exk/eyk/ezk
+
+    // Self-conjugate rim handling:
     const bool rim_x = (ix==0) || ((nx%2)==0 && ix==(nx/2));
     const bool rim_y = (iy==0) || ((ny%2)==0 && iy==(ny/2));
     const bool rim_z = (iz==0) || ((nz%2)==0 && iz==(nz/2));
 
-    // Imag parts must be zero on self-conjugate rims
-    if (rim_x) exk[idx].y = 0.0f;
-    if (rim_y) eyk[idx].y = 0.0f;
-    if (rim_z) ezk[idx].y = 0.0f;
+
+    // For φ(k) real on rims, E(k) should be purely imaginary after i*k multiplication.
+    // So zero the REAL parts, not the imaginary ones.
+    if (rim_x) exk[idx].x = 0.0f;
+    if (rim_y) eyk[idx].x = 0.0f;
+    if (rim_z) ezk[idx].x = 0.0f;
 }
 
 
@@ -199,32 +207,36 @@ void gather_forces_to_atoms(
     float w2=w*w, w3=w2*w, wm=1.f-w; float wz[4] = {(wm*wm*wm)/6.f,(3.f*w3-6.f*w2+4.f)/6.f,(-3.f*w3+3.f*w2+3.f*w+1.f)/6.f,w3/6.f};
 
     float Exi=0.f, Eyi=0.f, Ezi=0.f;
-    for (int32_t a=0; a<4; a++){
-        int32_t ix = wrap(ix0 + a, nx);
-        float wxa = wx[a];
+        for (int32_t a=0; a<4; a++){
+            int32_t ix = wrap(ix0 + a, nx);
+            float wxa = wx[a];
 
-        for (int32_t b=0; b<4; b++){
-            int32_t iy = wrap(iy0 + b, ny);
-            float wxy = wxa * wy[b];
-            size_t base = size_t(iy)*nx + ix;
+            for (int32_t b=0; b<4; b++){
+                int32_t iy = wrap(iy0 + b, ny);
+                float wxy = wxa * wy[b];
 
-            for (int32_t c=0; c<4; c++){
-                int32_t iz = wrap(iz0 + c, nz);
-                float wfac = wxy * wz[c];
-                size_t idx = size_t(iz)*nx*ny + base;
+                // Z-fast base for this (ix,iy)
+                size_t base = (size_t)ix * (size_t)(ny * nz) + (size_t)iy * (size_t)nz;
 
-                Exi += wfac * ex[idx];
-                Eyi += wfac * ey[idx];
-                Ezi += wfac * ez[idx];
-            }
+                for (int32_t c=0; c<4; c++){
+                    int32_t iz = wrap(iz0 + c, nz);
+                    float wfac = wxy * wz[c];
+                    size_t idx = base + (size_t)iz;   // contiguous over z
+
+                    Exi += wfac * ex[idx];
+                    Eyi += wfac * ey[idx];
+                    Ezi += wfac * ez[idx];
+               }
+           }
         }
-    }
 
     float s = q[i];
     out_f[i] = make_float3(Exi*s, Eyi*s, Ezi*s);
 }
 
 
+// todo: Can or should we combine this with ghat and grad as we do on the CPU? Likely
+// todo won't make much of a performance impact.
 // A kernel
 extern "C" __global__
 void energy_half_spectrum(
@@ -246,18 +258,13 @@ void energy_half_spectrum(
     int32_t tid = threadIdx.x;
     double acc = 0.0;
 
-    int32_t nxy = nx*ny;
-    int32_t n_cmplx = nxy*(nz/2 + 1);
-
-    // CUFFT normalization for |rho_k|^2
-    int32_t N = nx * ny * nz;
-    double invN2 = 1.0 / (double(N) * double(N));
+    int32_t nzc = nz/2 + 1;
+    int32_t n_cmplx = nx * ny * nzc;
 
     for (int32_t idx = blockIdx.x*blockDim.x + tid; idx < n_cmplx; idx += gridDim.x*blockDim.x) {
-        int32_t iz = idx / nxy;
-        int32_t rem = idx - iz*nxy;
-        int32_t iy = rem / nx;
-        int32_t ix = rem - iy*nx;
+        int32_t iz = idx % nzc;
+        int32_t iy = (idx / nzc) % ny;
+        int32_t ix =  idx / (nzc * ny);
 
         float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
         float k2  = fmaf(kxv,kxv, fmaf(kyv,kyv, kzv*kzv));
@@ -266,14 +273,19 @@ void energy_half_spectrum(
         float bmod2 = bx[ix]*by[iy]*bz[iz];
         if (bmod2 <= 1e-10f) continue;
 
-        float ghat = (2.0f*3.14159265358979323846f*2.0f / vol) * __expf(-k2/(4.0f*alpha*alpha)) / (k2*bmod2);
+        // 4π/vol * exp(-k²/(4α²)) / (k² * bmod²)
+        float ghat = (2.0f*3.14159265358979323846f*2.0f / vol) *
+                     __expf(-k2/(4.0f*alpha*alpha)) / (k2*bmod2);
 
-        float a = rho_k[idx].x, b = rho_k[idx].y;
-        double mag2 = double(a)*a + double(b)*b;
+        double a = (double)rho_k[idx].x;
+        double b = (double)rho_k[idx].y;
+        double phi_re = (double)ghat * a;
+        double phi_im = (double)ghat * b;
 
-        int32_t twice = (iz==0 || ((nz%2)==0 && iz==(nz/2))) ? 1 : 2;
-        acc += 0.5 * double(twice) * double(ghat) * (mag2 * invN2);
+        // 1/2 * Re{ rho*(k) * phi(k) } = 1/2 * (a*phi_re + b*phi_im)
+        acc += 0.5 * (a*phi_re + b*phi_im);
     }
+
     ssum[tid] = acc;
     __syncthreads();
     for (int32_t s = blockDim.x/2; s>0; s>>=1) {
@@ -281,12 +293,4 @@ void energy_half_spectrum(
         __syncthreads();
     }
     if (tid==0) out_partial[blockIdx.x] = ssum[0];
-}
-
-
-// A utility kernel.
-extern "C" __global__
-void scale_vec(float* x, int32_t n, float s) {
-    int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] *= s;
 }
