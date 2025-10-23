@@ -5,18 +5,16 @@ use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use lin_alg::f32::{Vec3, vec3s_to_dev};
-use rustfft::num_complex::Complex;
 
 #[cfg(feature = "cufft")]
 use crate::cufft;
 #[cfg(feature = "vkfft")]
 use crate::vk_fft;
-use crate::{PmeRecip, SQRT_PI, self_energy};
+use crate::{PmeRecip, self_energy};
 
 pub(crate) struct Kernels {
     pub kernel_spread: CudaFunction,
     pub kernel_ghat: CudaFunction,
-    // pub kernel_scale: CudaFunction,
     pub kernel_gather: CudaFunction,
     pub kernel_half_spectrum: CudaFunction,
 }
@@ -48,6 +46,7 @@ impl GpuTables {
 }
 
 impl PmeRecip {
+    /// Compute reciprocal-space forces on all positions, using the GPU.
     /// Note: We spread charges, and do other procedures on GPU that are already fast on the CPU.
     /// We handle it this way to prevent transfering more info to and from the GPU than required.
     pub fn forces_gpu(
@@ -92,13 +91,6 @@ impl PmeRecip {
             self.box_dims,
             posits.len() as u32,
         );
-
-        // {
-        //     let rho_cpu = stream.memcpy_dtov(&rho_real_dev).unwrap();
-        //     for i in 0..10 {
-        //         println!("rho GPU pre fwd FFT (re): {:?}", rho_cpu[i])
-        //     }
-        // }
 
         // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
@@ -269,7 +261,6 @@ impl PmeRecip {
             });
         }
 
-
         (f, energy)
     }
 }
@@ -375,10 +366,7 @@ fn spread_charges(
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
 
-/// Apply ĝ(k) – multiply each Fourier mode of the charge density by the Ewald/PME
-/// influence function to get the potential in k-space. Take the gradient of the potential in
-/// Fourier space to get the electric field.
-/// Launch the GPU kernel;  Apply G(k) and gradient to get Exk/Eyk/Ezk
+/// See notes on the CPU equivalent.
 fn apply_ghat_and_grad(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -428,7 +416,7 @@ fn apply_ghat_and_grad(
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
 
-/// Launch the GPU kernel.
+/// See notes on the CPU equivalent.
 fn energy_half_spectrum(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -476,7 +464,7 @@ fn energy_half_spectrum(
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
 
-/// Launch the GPU kernel.
+/// See notes on the CPU equivalent.
 fn gather_forces_to_atoms(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
@@ -496,8 +484,7 @@ fn gather_forces_to_atoms(
 
     let (lx, ly, lz) = box_dims;
 
-    // todo: QC if this is the right n!
-    let n = pos_gpu.len() / 3; // todo: QC!
+    let n = pos_gpu.len() / 3;
     let n_u32 = n as u32;
     let n_i32 = n as i32;
 
@@ -526,7 +513,8 @@ fn gather_forces_to_atoms(
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
 
-/// If we run `LaunchConfig::from_num_elems`, we get the error `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+/// If we run `LaunchConfig::from_num_elems` for certain kernels, we get the error
+/// `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
 fn launch_cfg(n: u32, block: u32) -> LaunchConfig {
     let grid = (n + block - 1) / block; // ceil_div
     LaunchConfig {

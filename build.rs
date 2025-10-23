@@ -27,8 +27,7 @@ fn main() {
     // VkFFT-specifical host-side building
     #[cfg(feature = "vkfft")]
     {
-        build_host(GpuArchitecture::Rtx3, &["src/cuda/kernels.cu"], "spme");
-
+        // Our FFI files.
         println!("cargo:rerun-if-changed=src/cuda/vk_fft.cu");
         println!("cargo:rerun-if-changed=src/cuda/vk_fft.h");
         // This is the vkFFT header
@@ -39,7 +38,7 @@ fn main() {
             .files(["src/cuda/vk_fft.cu"])
             .define("VKFFT_BACKEND", Some("1")) //  Sets the backend to CUDA
             // .define("_CRT_SECURE_NO_WARNINGS", None)
-            .include("src")
+            // .include("src/cuda")
             .include("third_party/VkFFT/vkFFT")
             .flag_if_supported("-O3")
             // .warnings(false)

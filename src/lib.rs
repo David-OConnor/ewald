@@ -25,6 +25,7 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
+// We are for now, exposing
 mod fft;
 
 #[cfg(feature = "cufft")]
@@ -39,11 +40,10 @@ use lin_alg::f32::Vec3;
 #[cfg(target_arch = "x86_64")]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use rayon::prelude::*;
-use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
-use crate::fft::{fft3_c2r, fft3_r2c};
+use crate::fft::{fft3d_c2r, fft3d_r2c};
 #[cfg(feature = "cuda")]
 use crate::gpu_shared::{GpuTables, Kernels};
 
@@ -178,6 +178,7 @@ impl PmeRecip {
     }
 
     /// CPU charge spreading. Z as the fast/contiguous axis.
+    /// We place charges on a discrete grid, then apply a 3D FFT to the grid.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
         let (nx, ny, nz) = self.plan_dims;
         let (lx, ly, lz) = self.box_dims;
@@ -220,7 +221,6 @@ impl PmeRecip {
     pub fn forces(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32) {
         assert_eq!(posits.len(), q.len());
 
-        let (lx, ly, lz) = self.box_dims;
         let (nx, ny, nz) = self.plan_dims;
 
         // Z is the fast dimension; keep this consistent with the CPU FFT setup, and
@@ -239,7 +239,7 @@ impl PmeRecip {
         // }
 
         // Convert spread charges to K space
-        let mut rho = fft3_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
+        let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
 
         // for i in 220..230 {
         //     println!("rho CPU post fwd FFT: {:?}", rho[i])
@@ -267,9 +267,9 @@ impl PmeRecip {
         // println!("\n");
 
         // Inverse FFT to real-space E grids (C2R)
-        let ex = fft3_c2r(&mut exk, self.plan_dims, &mut self.planner);
-        let ey = fft3_c2r(&mut eyk, self.plan_dims, &mut self.planner);
-        let ez = fft3_c2r(&mut ezk, self.plan_dims, &mut self.planner);
+        let ex = fft3d_c2r(&mut exk, self.plan_dims, &mut self.planner);
+        let ey = fft3d_c2r(&mut eyk, self.plan_dims, &mut self.planner);
+        let ez = fft3d_c2r(&mut ezk, self.plan_dims, &mut self.planner);
 
         // for i in 220..230 {
         //     println!("exk CPU post inv FFT: {:?}", ex[i])
@@ -376,8 +376,8 @@ fn make_k_array(n: usize, L: f32) -> Vec<f32> {
     out
 }
 
-/// |B(k)|^2 for B-spline of order m (PME deconvolution).
-/// Use signed/wrapped index distance to 0 to avoid over-amplifying near Nyquist.
+/// |B(k)|^2 for Cardinal B-splines of order 4 (PME deconvolution).
+/// Use signed/wrapped index distance to 0 to avoid over-amplifying near the Nyquist frequency.
 fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
     assert!(m >= 1);
     let mut v = vec![0.0; n];
@@ -427,16 +427,13 @@ fn wrap(i: isize, n: usize) -> usize {
     v as usize
 }
 
-///  Ideally, use a combined GPU kernel with Lennard Jones, or a SIMD variant, instead of this.
-///  We use this for short-range Coulomb forces on the CPU, as part of SPME.
-/// `cutoff_dist` is the distance, in Å, we switch between short-range, and long-range reciprical
-/// forces. 10Å is a good default. 0.35Å for α is a good default for a custoff of 10Å. It truncates
-/// the real-space interaction. Th reciprical part does not use this.
+///  Computes the direct, short-range component. Ideally, use a combined GPU kernel with Lennard Jones,
+/// or a SIMD variant, instead of this.  We use this for short-range Coulomb forces on the CPU, as part of SPME.
+/// `cutoff_dist` is the distance, in Å, at which we no longer apply any force from this component.
+/// α controls the blending of short and long-range forces; 0.35Å for α is a good default for a cutoff of 10Å.
 ///
 /// This assumes diff (and dir) is in order tgt - src.
-/// Also returns potential energy.
-///
-/// `dir` must be a unit vector.
+/// Also returns potential energy. `dir` must be a unit vector.
 pub fn force_coulomb_short_range(
     dir: Vec3,
     dist: f32,
@@ -447,7 +444,6 @@ pub fn force_coulomb_short_range(
     cutoff_dist: f32,
     α: f32,
 ) -> (Vec3, f32) {
-    // Outside the taper region; return 0. (All the force is handled in the long-range region.)
     if dist >= cutoff_dist {
         return (Vec3::new_zero(), 0.);
     }
@@ -565,8 +561,10 @@ pub fn force_coulomb_short_range_x16(
     }
 }
 
-/// Useful for scaling corrections, e.g. 1-4 exclusions in AMBER.
-pub fn ewald_comp_force(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3 {
+/// For flexible molecules, computes the correction term.
+/// May be useful for scaling corrections, e.g. bonded scaling and exlusions?
+/// todo: This may not be suitable for general use.
+pub fn force_correction(dir: Vec3, r: f32, qi: f32, qj: f32, alpha: f32) -> Vec3 {
     // Complement of the real-space Ewald kernel; this is what “belongs” to reciprocal.
     let qfac = qi * qj;
     let inv_r = 1.0 / r;

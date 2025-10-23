@@ -23,7 +23,9 @@ lin_alg = "1.3.9"
 # We use this to get the erf error function for use in the Ewald approximation in MD
 # todo: Way to avoid this dep for something lighter?
 statrs = "0.18.0"
-rustfft = "6.4.1" # For long range reciprical forces
+
+# `realfft` is an augmentation that allows for R2C and C2R functionality.
+rustfft = "6.4.1"
 realfft = "3.5.0"
 
 rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
@@ -34,11 +36,11 @@ cudarc = { version = "0.17.2", default-features = false, features = ["std", "dri
 cudarc = { version = "0.17.2", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-13000"], optional=true }
 
 [build-dependencies]
-cuda_setup = { version = "0.1.7", optional = true }
+cuda_setup = { version = "0.1.9", optional = true }
 cc = "1.2.41"
 
 
 [features]
-cuda = []  # No associated deps; just to feature gate code that applies to either FFI lib.
-cufft = ["cuda_setup", "cudarc", "lin_alg/cuda", "cuda"]
-vkfft = ["cuda_setup", "cudarc", "lin_alg/cuda", "cuda"]
+cuda = ["cuda_setup", "cudarc", "lin_alg/cuda"]
+cufft = ["cuda"]
+vkfft = ["cuda"]

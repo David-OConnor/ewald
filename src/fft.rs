@@ -5,12 +5,12 @@ use rustfft::FftPlanner;
 
 use crate::Complex_;
 
-/// Real to Complex FFT. This approach uses less memory, and is probably faster,
-/// than using complex to complex. (Factor of 2 for the memory).
+/// Real-to-Complex 3D FFT. This approach uses less memory, and is probably faster,
+/// than using complex to complex transform (Factor of 2 for the memory).
 ///
 /// Z is the contiguous (fast) dimension; X is the strided (slow) one. This is chosen
-/// to be consistnt with cuFFT's `Plan3D`'s conventions.
-pub(crate) fn fft3_r2c(
+/// to be consistent with cuFFT's `Plan3D`'s conventions.
+pub fn fft3d_r2c(
     data_r: &mut [f32],
     dims: (usize, usize, usize),
     planner: &mut FftPlanner<f32>,
@@ -74,8 +74,11 @@ pub(crate) fn fft3_r2c(
     out
 }
 
-// todo: Why is data_k mut, and we return something? Real part mutated ends up as the returned value.
-pub(crate) fn fft3_c2r(
+/// Real-to-Complex 3D FFT.
+///
+/// Z is the contiguous (fast) dimension; X is the strided (slow) one. This is chosen
+/// to be consistent with cuFFT's `Plan3D`'s conventions.
+pub fn fft3d_c2r(
     data_k: &mut [Complex_],
     dims: (usize, usize, usize),
     planner: &mut FftPlanner<f32>,
@@ -83,8 +86,8 @@ pub(crate) fn fft3_c2r(
     let (nx, ny, nz) = dims;
     let nzc = nz / 2 + 1;
 
-    let mut rplanner = RealFftPlanner::<f32>::new();
-    let c2r_z = rplanner.plan_fft_inverse(nz);
+    let mut planner_real = RealFftPlanner::<f32>::new();
+    let c2r_z = planner_real.plan_fft_inverse(nz);
 
     let ifft_y = planner.plan_fft_inverse(ny);
     let ifft_x = planner.plan_fft_inverse(nx);

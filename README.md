@@ -8,14 +8,26 @@
 
 [Original paper describing the SPME method, by Ulrich et al](https://biomolmd.org/mw/images/e/e0/Spme.pdf)
 
+Compute Coulomb forces for systems with periodic boundary conditions in an efficient, accurate way. Forces are broken
+into three components: 
+
+ - A short-range, *direct force*, 
+ - A long-range *reciprical force*
+ - A *correction force*, in the case of flexible molecules.
+
+The bulk of the algorithmic complexity is in the *reciprical force*. This spreads charges along a discrete grid, and uses 
+Fourier analysis to compute force vectors. The *direct force* is similar to a Coulomb calculation, but uses a fixed distance 
+ cutoff, and ewald screening.
+
 This library is for Python and Rust. It supports GPU, and thread-pooled CPU.
 
 **Note: The Python version is currently CPU only**. We would like to fix this, but are having trouble
-linking Cuda.
+linking the Cuda FFTs.
 
 This has applications primarily in structural biology and chemistry simulations. For example, molecular dynamics.
 It's used to compute Coulomb (or equivalent) forces in systems using an approximation for long-range forces that
-doesn't scale with $O(n^2)$. 
+scales as $N log(N)$ with respect to system size.
+
 Compared to other n-body approximations for long-range forces, this has utility when periodic bounday conditions are used.
 If not using these, for example in cosmology simulations, consider Barnes Hut, or Fast Multipole Methods (FMM)
 instead.
@@ -33,11 +45,13 @@ the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
 Uses `f32` for Coulomb interactions. Energy sums are computed as `f64`.
 
-Here's an example of use. The Python API is equivalent.
-
 Note: For optimal performance, you may wish to implement short-range SPME integrated with Lennard Jones interactions
 in your application as an integrated GPU kernel, instead of using the short-range function here directly. This
 library is most effectively used for its reciprical implemention on GPU.
+
+Below is an example of use. The Python API is equivalent.
+
+
 
 ```rust
 use rayon::prelude::*;
@@ -104,23 +118,6 @@ impl System {
     }
 }
 ```
-
-
-[//]: # (### Note: Try this to reduce linux wheel size with cuda:)
-
-[//]: # (maturin build --release --strip)
-
-[//]: # ()
-[//]: # (auditwheel repair \)
-
-[//]: # (--exclude libcufft.so.12 \)
-
-[//]: # (--exclude libnvrtc.so.12 \)
-
-[//]: # (--exclude libcublas.so.12 \)
-
-[//]: # (target/ &#40;etc&#41;)
-
 
 
 ## References
