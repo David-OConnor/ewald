@@ -12,6 +12,17 @@ use crate::cufft;
 use crate::vk_fft;
 use crate::{PmeRecip, self_energy};
 
+/// Group GPU-specific state, so they can be made an option as a whole, in the case
+/// of compiling with GPU support, but no stream is available.
+pub(crate) struct GpuData {
+    /// FFI to the CPU planner.
+    pub planner_gpu: *mut c_void,
+    pub gpu_tables: GpuTables,
+    pub kernels: Kernels,
+    #[cfg(feature = "vkfft")]
+    pub vk_ctx: Arc<vk_fft::VkContext>,
+}
+
 pub(crate) struct Kernels {
     pub kernel_spread: CudaFunction,
     pub kernel_ghat: CudaFunction,
@@ -55,6 +66,10 @@ impl PmeRecip {
         posits: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
+        let Some(data) = &mut self.gpu_data else {
+            panic!("Error: Computing forces on GPU without having initialized on GPU");
+        };
+
         assert_eq!(posits.len(), q.len());
 
         let (nx, ny, nz) = self.plan_dims;
@@ -83,7 +98,7 @@ impl PmeRecip {
 
         spread_charges(
             stream,
-            &self.kernels.kernel_spread,
+            &data.kernels.kernel_spread,
             &pos_dev,
             &q_dev,
             &mut rho_real_dev,
@@ -95,7 +110,7 @@ impl PmeRecip {
         // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
             exec_forward(
-                self.planner_gpu,
+                data.planner_gpu,
                 cuda_slice_to_ptr_mut(&rho_real_dev, stream),
                 cuda_slice_to_ptr_mut(&rho_dev, stream),
             );
@@ -129,12 +144,12 @@ impl PmeRecip {
         // Apply G(k) and gradient to get Exk/Eyk/Ezk
         apply_ghat_and_grad(
             stream,
-            &self.kernels.kernel_ghat,
+            &data.kernels.kernel_ghat,
             &rho_dev,
             &mut exk_dev,
             &mut eyk_dev,
             &mut ezk_dev,
-            &self.gpu_tables,
+            &data.gpu_tables,
             self.plan_dims,
             self.vol,
             self.alpha,
@@ -165,10 +180,10 @@ impl PmeRecip {
 
         energy_half_spectrum(
             stream,
-            &self.kernels.kernel_half_spectrum,
+            &data.kernels.kernel_half_spectrum,
             &mut rho_dev,
             &mut out_partial_gpu,
-            &self.gpu_tables,
+            &data.gpu_tables,
             self.plan_dims,
             self.vol,
             self.alpha,
@@ -194,7 +209,7 @@ impl PmeRecip {
 
         unsafe {
             exec_inverse(
-                self.planner_gpu,
+                data.planner_gpu,
                 ekx_ptr,
                 eky_ptr,
                 ekz_ptr,
@@ -237,7 +252,7 @@ impl PmeRecip {
 
         gather_forces_to_atoms(
             stream,
-            &self.kernels.kernel_gather,
+            &data.kernels.kernel_gather,
             &pos_dev,
             &q_dev,
             &ex_dev,
@@ -283,13 +298,16 @@ unsafe extern "C" {
 
 impl Drop for PmeRecip {
     fn drop(&mut self) {
+        let Some(data) = &mut self.gpu_data else {
+            return;
+        };
         unsafe {
-            if !self.planner_gpu.is_null() {
+            if !data.planner_gpu.is_null() {
                 #[cfg(feature = "vkfft")]
-                vk_fft::destroy_plan(self.planner_gpu);
+                vk_fft::destroy_plan(data.planner_gpu);
                 #[cfg(feature = "cufft")]
-                cufft::destroy_plan(self.planner_gpu);
-                self.planner_gpu = std::ptr::null_mut();
+                cufft::destroy_plan(data.planner_gpu);
+                data.planner_gpu = std::ptr::null_mut();
             }
         }
     }
