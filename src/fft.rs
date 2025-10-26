@@ -1,11 +1,15 @@
 //! CPU FFT setup
 
+use std::ffi::c_void;
+use std::sync::Arc;
+use cudarc::driver::{CudaSlice, CudaStream};
 use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 
 use crate::Complex_;
+use crate::gpu_shared::cuda_slice_to_ptr_mut;
 
-/// Real-to-Complex 3D FFT. This approach uses less memory, and is probably faster,
+/// Real-to-Complex forward 3D FFT. This approach uses less memory, and is probably faster,
 /// than using complex to complex transform (Factor of 2 for the memory).
 ///
 /// Z is the contiguous (fast) dimension; X is the strided (slow) one. This is chosen
@@ -74,7 +78,7 @@ pub fn fft3d_r2c(
     out
 }
 
-/// Real-to-Complex 3D FFT.
+/// Complex-to-real inverse 3D FFT.
 ///
 /// Z is the contiguous (fast) dimension; X is the strided (slow) one. This is chosen
 /// to be consistent with cuFFT's `Plan3D`'s conventions.
@@ -145,4 +149,54 @@ pub fn fft3d_c2r(
     }
 
     out
+}
+
+// // todo: Experimenting
+// #[cfg(feature = "cuda")]
+// pub fn fft3d_c2r_gpu(
+//     data_k: &mut [Complex_],
+//     dims: (usize, usize, usize),
+//     stream: &Arc<CudaStream>,
+// ) -> Vec<f32> {
+//     let ex_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+//     let ey_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+//     let ez_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
+//
+//     let ex_ptr = cuda_slice_to_ptr_mut(&ex_dev, stream);
+//     let ey_ptr = cuda_slice_to_ptr_mut(&ey_dev, stream);
+//     let ez_ptr = cuda_slice_to_ptr_mut(&ez_dev, stream);
+//
+//     unsafe {
+//         exec_inverse(
+//             data.planner_gpu,
+//             ekx_ptr,
+//             eky_ptr,
+//             ekz_ptr,
+//             ex_ptr,
+//             ey_ptr,
+//             ez_ptr,
+//         );
+//     }
+//
+//     let ex = stream.memcpy_dtov(&ex_dev).unwrap();
+//     let ey = stream.memcpy_dtov(&ey_dev).unwrap();
+//     let ez = stream.memcpy_dtov(&ez_dev).unwrap();
+// }
+
+#[cfg(feature = "cuda")]
+// FFI for GPU FFT functions. These signatures are the same for cuFFT and vkFFT, so we use
+// them for both.
+unsafe extern "C" {
+    /// A forward real-to-complex FFT, using cuFFT or vkFFT.
+    pub(crate) fn exec_forward(plan: *mut c_void, rho_real: *mut c_void, rho: *mut c_void);
+
+    pub(crate) fn exec_inverse(
+        plan: *mut c_void,
+        exk: *mut c_void,
+        eyk: *mut c_void,
+        ezk: *mut c_void,
+        ex: *mut c_void,
+        ey: *mut c_void,
+        ez: *mut c_void,
+    );
 }

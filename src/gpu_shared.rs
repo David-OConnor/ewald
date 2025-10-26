@@ -11,6 +11,7 @@ use crate::cufft;
 #[cfg(feature = "vkfft")]
 use crate::vk_fft;
 use crate::{PmeRecip, self_energy};
+use crate::fft::{exec_inverse, exec_forward};
 
 /// Group GPU-specific state, so they can be made an option as a whole, in the case
 /// of compiling with GPU support, but no stream is available.
@@ -280,21 +281,6 @@ impl PmeRecip {
     }
 }
 
-// FFI for GPU FFT functions. These signatures are the same for cuFFT and vkFFT, so we use
-// them for both.
-unsafe extern "C" {
-    pub(crate) fn exec_forward(plan: *mut c_void, rho_real: *mut c_void, rho: *mut c_void);
-
-    pub(crate) fn exec_inverse(
-        plan: *mut c_void,
-        exk: *mut c_void,
-        eyk: *mut c_void,
-        ezk: *mut c_void,
-        ex: *mut c_void,
-        ey: *mut c_void,
-        ez: *mut c_void,
-    );
-}
 
 impl Drop for PmeRecip {
     fn drop(&mut self) {

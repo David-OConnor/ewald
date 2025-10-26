@@ -64,94 +64,39 @@ void vk_destroy_context(void* ctx_) {
 }
 
 // Set up a plan for a 3D FFT using real-to-complex, and complex-to-real transforms.
-void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz) {
+void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz, void* cu_stream) {
     VkContext* c = (VkContext*)ctx_;
     VkFftPlan* p = (VkFftPlan*)calloc(1, sizeof(VkFftPlan));
 
-    // 1) ASSIGN THESE FIRST
-    p->Nx = (uint64_t)nx;
-    p->Ny = (uint64_t)ny;
-    p->Nz = (uint64_t)nz;
+    p->stream = cu_stream;
 
-    uint64_t Nz  = p->Nz;
-    uint64_t Ny  = p->Ny;
-    uint64_t Nx  = p->Nx;
-    uint64_t nzc = Nz/2 + 1;
+    VkFFTConfiguration& c = p->cfg;
+    // Driver/stream hooks (CUDA backend).
+    c.device      = &p->cu_dev;       // CUdevice*
+    c.stream      = &p->stream;       // cudaStream_t*
+    c.num_streams = 1;
 
-    size_t s_r = sizeof(float);      // real
-    size_t s_c = sizeof(float2);     // complex (interleaved)
+    // 3D transform. Map cuFFT (x,y,z) -> VkFFT (D,H,W) with W fastest.
+    // So set W= nz, H= ny, D= nx to make Z the contiguous dimension like cuFFT.
+    c.FFTdim   = 3;
+    c.size[0]  = (uint64_t)nz;  // W (fastest)  == cuFFT's Z
+    c.size[1]  = (uint64_t)ny;  // H            == cuFFT's Y
+    c.size[2]  = (uint64_t)nx;  // D (slowest)  == cuFFT's X
 
-    // -------------------------------
-    // Forward (R2C) configuration
-    // -------------------------------
-    memset(&p->cfg_r2c, 0, sizeof(p->cfg_r2c));
-    p->cfg_r2c.FFTdim = 3;
+    // Real<->Complex transforms; un-normalized inverse (matches cuFFT defaults).
+    c.performR2C = 1; // enables R2C/C2R
+    c.normalize  = 0; // cuFFT is un-normalized on inverse
 
-    // 2) TELL VkFFT THE LOGICAL SIZES (Z-fast: [Nz, Ny, Nx])
-    p->cfg_r2c.size[0] = Nz;   // fast (W)  <- Z
-    p->cfg_r2c.size[1] = Ny;   //           <- Y
-    p->cfg_r2c.size[2] = Nx;   //           <- X
+    // Single batch, single-precision by default (matches your CUFFT_R2C/C2R FP32).
+    c.numberBatches = 1;
 
-    // Real input strides (BYTES), Z-fast: [1, Nz, Ny*Nz]
-    p->cfg_r2c.inputBufferStride[0] = (Ny * Nz) * s_r;  // step 1 in X = jump an entire YZ plane
-    p->cfg_r2c.inputBufferStride[1] = (Nz)      * s_r;  // step 1 in Y = jump one Z-line
-    p->cfg_r2c.inputBufferStride[2] = (1)       * s_r;  // step 1 in Z = move to next element
-
-    // Complex output [Nx, Ny, nzc] with Z' contiguous:
-    p->cfg_r2c.outputBufferStride[0] = (Ny * nzc) * s_c; // step 1 in X
-    p->cfg_r2c.outputBufferStride[1] = (nzc)      * s_c; // step 1 in Y
-    p->cfg_r2c.outputBufferStride[2] = (1)        * s_c; // step 1 in Z'
-
-    p->cfg_r2c.disableMergeSequencesR2C = 1;
-
-    p->cfg_r2c.performR2C = 1;
-    p->cfg_r2c.normalize  = 0;
-    p->cfg_r2c.numberBatches = 1;
-
-    p->cfg_r2c.device = &c->dev;
-    p->cfg_r2c.stream = &c->stream;
-    p->cfg_r2c.num_streams = 1;
-
-    // -------------------------------
-    // Inverse (C2R) configuration
-    // -------------------------------
-    memset(&p->cfg_c2r, 0, sizeof(p->cfg_c2r));
-    p->cfg_c2r.FFTdim = 3;
-
-    // 2) LOGICAL SIZES AGAIN (Z-fast)
-    p->cfg_c2r.size[0] = Nz;   // fast (W)  <- Z
-    p->cfg_c2r.size[1] = Ny;   //           <- Y
-    p->cfg_c2r.size[2] = Nx;   //           <- X
-
-    p->cfg_c2r.inputBufferStride[0] = 1      * s_c;          // Z' step
-    p->cfg_c2r.inputBufferStride[1] = nzc    * s_c;          // Y step
-    p->cfg_c2r.inputBufferStride[2] = Ny*nzc * s_c;          // X step
-
-    // Real output full strides (BYTES), Z-fast
-    p->cfg_c2r.outputBufferStride[0] = 1      * s_r;         // Z step
-    p->cfg_c2r.outputBufferStride[1] = Nz     * s_r;         // Y step
-    p->cfg_c2r.outputBufferStride[2] = Ny*Nz  * s_r;         // X step
-
-    p->cfg_c2r.performR2C = 0;    // C2R
-    p->cfg_c2r.normalize  = 0;    // match cuFFT (unnormalized)
-    p->cfg_c2r.numberBatches = 1; // one field per call
-
-    p->cfg_c2r.device = &c->dev;
-    p->cfg_c2r.stream = &c->stream;
-    p->cfg_c2r.num_streams = 1;
-
-    // -------------------------------
-    // Initialize VkFFT plans
-    // -------------------------------
-    if (initializeVkFFT(&p->app_r2c, p->cfg_r2c) != VKFFT_SUCCESS) {
+    // Initialize once; you’ll pass buffers at launch time via VkFFTLaunchParams.
+    VkFFTResult res = initializeVkFFT(&p->app, &p->cfg);
+    if (res != VKFFT_SUCCESS) {
         free(p);
-        return NULL;
+        return nullptr;
     }
-    if (initializeVkFFT(&p->app_c2r, p->cfg_c2r) != VKFFT_SUCCESS) {
-        deleteVkFFT(&p->app_r2c);
-        free(p);
-        return NULL;
-    }
+
     return p;
 }
 

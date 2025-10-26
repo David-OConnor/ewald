@@ -21,7 +21,6 @@ pub(crate) fn create_gpu_plan(
     stream: &Arc<CudaStream>,
 ) -> *mut c_void {
     let raw_stream: *mut c_void = stream.cu_stream() as *mut c_void;
-
     let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
 
     unsafe { make_plan(nx, ny, nz, raw_stream) }
