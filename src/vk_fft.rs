@@ -36,7 +36,13 @@ impl VkContext {
 
 unsafe extern "C" {
     // plan lifecycle
-    pub fn make_plan(ctx: *mut c_void, nx: i32, ny: i32, nz: i32, cu_stream: *mut c_void) -> *mut c_void;
+    pub fn make_plan(
+        ctx: *mut c_void,
+        nx: i32,
+        ny: i32,
+        nz: i32,
+        cu_stream: *mut c_void,
+    ) -> *mut c_void;
     pub fn destroy_plan(plan: *mut c_void);
 
     pub fn exec_inverse(plan: *mut c_void, complex_in_dev: *mut c_void, real_out_dev: *mut c_void);
@@ -55,7 +61,11 @@ impl PmeRecip {
 }
 
 /// Create the GPU plan. Run this at init, or when dimensions change.
-pub(crate) fn create_gpu_plan(dims: (usize, usize, usize), ctx: &Arc<VkContext>, stream: &Arc<CudaStream>,) -> *mut c_void {
+pub(crate) fn create_gpu_plan(
+    dims: (usize, usize, usize),
+    ctx: &Arc<VkContext>,
+    stream: &Arc<CudaStream>,
+) -> *mut c_void {
     let raw_stream: *mut c_void = stream.cu_stream() as *mut c_void;
     let (nx, ny, nz) = (dims.0 as i32, dims.1 as i32, dims.2 as i32);
 

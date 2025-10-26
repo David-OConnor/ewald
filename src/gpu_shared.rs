@@ -10,8 +10,11 @@ use lin_alg::f32::{Vec3, vec3s_to_dev};
 use crate::cufft;
 #[cfg(feature = "vkfft")]
 use crate::vk_fft;
-use crate::{PmeRecip, self_energy};
-use crate::fft::{exec_inverse, exec_forward};
+use crate::{
+    PmeRecip,
+    fft::{exec_forward, exec_inverse},
+    self_energy,
+};
 
 /// Group GPU-specific state, so they can be made an option as a whole, in the case
 /// of compiling with GPU support, but no stream is available.
@@ -280,7 +283,6 @@ impl PmeRecip {
         (f, energy)
     }
 }
-
 
 impl Drop for PmeRecip {
     fn drop(&mut self) {

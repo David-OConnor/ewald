@@ -39,8 +39,8 @@ mod gpu_shared;
 use lin_alg::f32::Vec3;
 #[cfg(target_arch = "x86_64")]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
-use rayon::prelude::*;use rustfft::{FftPlanner, num_complex::Complex};
-
+use rayon::prelude::*;
+use rustfft::{FftPlanner, num_complex::Complex};
 use statrs::function::erf::{erf, erfc};
 
 pub use crate::fft::{fft3d_c2r, fft3d_r2c};
