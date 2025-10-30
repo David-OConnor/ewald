@@ -23,24 +23,21 @@
 //     uint64_t Nx, Ny, Nz;
 // } VkFftPlan;
 
-
 typedef struct VkContext {
     CUdevice  dev;
     CUcontext ctx;
     CUstream  stream;
-    int       owns_stream; // 0 = adopted, 1 = we created it
+    int       owns_stream;
 } VkContext;
 
-// Our plan: single app, single cfg, plus cached CUDA handles.
 typedef struct VkFftPlan {
-    VkFFTApplication  app;
+    VkFFTApplication   app;
     VkFFTConfiguration cfg;
     CUdevice           cu_dev;
     CUcontext          cu_ctx;
     cudaStream_t       stream;
+    uint64_t           Nx, Ny, Nz;   // store dims for caller
 } VkFftPlan;
-
-
 
 void* vk_make_context_from_stream(void* cu_stream_void) {
     VkContext* c = (VkContext*)calloc(1, sizeof(VkContext));
@@ -90,6 +87,7 @@ void vk_destroy_context(void* ctx_) {
     free(c);
 }
 
+// 3D R2C/C2R
 void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz, void* cu_stream)
 {
     VkContext* g = (VkContext*)ctx_;
@@ -99,15 +97,22 @@ void* make_plan(void* ctx_, int32_t nx, int32_t ny, int32_t nz, void* cu_stream)
 
     p->cu_dev  = g->dev;
     p->cu_ctx  = g->ctx;
-    p->stream  = cu_stream ? (cudaStream_t)cu_stream
-                           : (cudaStream_t)g->stream;
+    p->stream  = cu_stream ? (cudaStream_t)cu_stream : (cudaStream_t)g->stream;
+
+    p->Nx = (uint64_t)nx;
+    p->Ny = (uint64_t)ny;
+    p->Nz = (uint64_t)nz;
 
     VkFFTConfiguration* cfg = &p->cfg;
     memset(cfg, 0, sizeof(*cfg));
 
     cfg->device      = &p->cu_dev;
+    cfg->context     = &p->cu_ctx;   // <-- important for CUDA backend
     cfg->stream      = &p->stream;
     cfg->num_streams = 1;
+
+    cfg->isInputFormatted  = 1;
+    cfg->isOutputFormatted = 1;
 
     cfg->FFTdim  = 3;
     cfg->size[0] = (uint64_t)nz;
@@ -137,6 +142,8 @@ void destroy_plan(void* plan_) {
 void exec_forward(void* plan_, void* real_in, void* complex_out) {
     VkFftPlan* p = (VkFftPlan*)plan_;
 
+    cuCtxSetCurrent(p->cu_ctx);  // <-- make sure we’re on the right ctx
+
     CUdeviceptr in  = (CUdeviceptr)real_in;
     CUdeviceptr out = (CUdeviceptr)complex_out;
 
@@ -145,13 +152,17 @@ void exec_forward(void* plan_, void* real_in, void* complex_out) {
 
     lp.buffer       = (void**)&in;
     lp.outputBuffer = (void**)&out;
-    // no lp.stream: VkFFTLaunchParams in your headers doesn’t have it; stream is in cfg.
 
-    VkFFTAppend(&p->app, -1, &lp); // forward
+    VkFFTResult res = VkFFTAppend(&p->app, -1, &lp);
+    if (res != VKFFT_SUCCESS) {
+        // printf("VkFFT forward failed: %d\n", res);
+    }
 }
 
 void exec_inverse(void* plan_, void* complex_in, void* real_out) {
     VkFftPlan* p = (VkFftPlan*)plan_;
+
+    cuCtxSetCurrent(p->cu_ctx);  // <-- same here
 
     CUdeviceptr in  = (CUdeviceptr)complex_in;
     CUdeviceptr out = (CUdeviceptr)real_out;
@@ -162,5 +173,8 @@ void exec_inverse(void* plan_, void* complex_in, void* real_out) {
     lp.buffer       = (void**)&in;
     lp.outputBuffer = (void**)&out;
 
-    VkFFTAppend(&p->app, 1, &lp); // inverse
+    VkFFTResult res = VkFFTAppend(&p->app, 1, &lp);
+    if (res != VKFFT_SUCCESS) {
+        // printf("VkFFT inverse failed: %d\n", res);
+    }
 }
