@@ -145,7 +145,7 @@ impl PmeRecip {
                     #[cfg(feature = "vkfft")]
                     let vk_ctx = Arc::new(vk_fft::VkContext::default());
                     #[cfg(feature = "vkfft")]
-                    let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx);
+                    let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx, s);
 
                     Some(GpuData {
                         planner_gpu,
