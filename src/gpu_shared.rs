@@ -5,16 +5,18 @@ use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use lin_alg::f32::{Vec3, vec3s_to_dev};
+use rustfft::num_complex::Complex;
 
-#[cfg(feature = "cufft")]
-use crate::cufft;
-#[cfg(feature = "vkfft")]
-use crate::vk_fft;
+// #[cfg(feature = "cufft")]
+// use crate::cufft;
+// #[cfg(feature = "vkfft")]
+// use crate::vk_fft;
 use crate::{
     PmeRecip,
     fft::{exec_forward, exec_inverse},
     self_energy,
 };
+use crate::fft::destroy_plan;
 
 /// Group GPU-specific state, so they can be made an option as a whole, in the case
 /// of compiling with GPU support, but no stream is available.
@@ -23,8 +25,8 @@ pub(crate) struct GpuData {
     pub planner_gpu: *mut c_void,
     pub gpu_tables: GpuTables,
     pub kernels: Kernels,
-    #[cfg(feature = "vkfft")]
-    pub vk_ctx: Arc<vk_fft::VkContext>,
+    // #[cfg(feature = "vkfft")]
+    // pub vk_ctx: Arc<vk_fft::VkContext>,
 }
 
 pub(crate) struct Kernels {
@@ -120,18 +122,18 @@ impl PmeRecip {
             );
         }
 
-        // {
-        //     let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
-        //     let mut rho_dbg = Vec::new();
-        //     for i in 0..complex_len / 2 {
-        //         rho_dbg.push(Complex::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
-        //     }
-        //
-        //     println!("\n");
-        //     for i in 220..230 {
-        //         println!("rho GPU post fwd FFT: {:?}", rho_dbg[i])
-        //     }
-        // }
+        {
+            let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
+            let mut rho_dbg = Vec::new();
+            for i in 0..complex_len / 2 {
+                rho_dbg.push(Complex::<f32>::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
+            }
+
+            println!("\n");
+            for i in 220..230 {
+                println!("rho GPU post fwd FFT: {:?}", rho_dbg[i])
+            }
+        }
 
         // todo: Pre-allocate these instead of every step?
         // Contiguous complex buffer: [exk | eyk | ezk]
@@ -179,7 +181,6 @@ impl PmeRecip {
         //     // }
         // }
 
-        // todo: Qc this! Not sure what it should be.
         let mut out_partial_gpu: CudaSlice<f64> = stream.alloc_zeros(n_cplx).unwrap();
 
         energy_half_spectrum(
@@ -291,10 +292,11 @@ impl Drop for PmeRecip {
         };
         unsafe {
             if !data.planner_gpu.is_null() {
-                #[cfg(feature = "vkfft")]
-                vk_fft::destroy_plan(data.planner_gpu);
-                #[cfg(feature = "cufft")]
-                cufft::destroy_plan(data.planner_gpu);
+                // #[cfg(feature = "vkfft")]
+                // vk_fft::destroy_plan(data.planner_gpu);
+                // #[cfg(feature = "cufft")]
+                // cufft::destroy_plan(data.planner_gpu);
+                destroy_plan(data.planner_gpu);
                 data.planner_gpu = std::ptr::null_mut();
             }
         }

@@ -28,10 +28,10 @@ use cudarc::{
 // We are for now, exposing
 mod fft;
 
-#[cfg(feature = "cufft")]
-mod cufft;
-#[cfg(feature = "vkfft")]
-pub mod vk_fft;
+// #[cfg(feature = "cufft")]
+// mod cufft;
+// #[cfg(feature = "vkfft")]
+// pub mod vk_fft;
 
 #[cfg(feature = "cuda")]
 mod gpu_shared;
@@ -139,20 +139,23 @@ impl PmeRecip {
                         GpuTables::new(k, bmod2, s)
                     };
 
-                    #[cfg(feature = "cufft")]
-                    let planner_gpu = cufft::create_gpu_plan(plan_dims, s);
 
-                    #[cfg(feature = "vkfft")]
-                    let vk_ctx = Arc::new(vk_fft::VkContext::default());
-                    #[cfg(feature = "vkfft")]
-                    let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx, s);
+                    // let planner_gpu = cufft::create_gpu_plan(plan_dims, s);
+
+                    #[cfg(feature = "cuda")]
+                    let planner_gpu = fft::create_gpu_plan(plan_dims, s);
+
+                    // #[cfg(feature = "vkfft")]
+                    // let vk_ctx = Arc::new(vk_fft::VkContext::default());
+                    // #[cfg(feature = "vkfft")]
+                    // let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx, s);
 
                     Some(GpuData {
                         planner_gpu,
                         gpu_tables,
                         kernels,
-                        #[cfg(feature = "vkfft")]
-                        vk_ctx,
+                        // #[cfg(feature = "vkfft")]
+                        // vk_ctx,
                     })
                 }
                 Err(_) => None,
