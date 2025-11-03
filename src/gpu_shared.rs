@@ -7,6 +7,7 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfi
 use lin_alg::f32::{Vec3, vec3s_to_dev};
 use rustfft::num_complex::Complex;
 
+use crate::fft::destroy_plan;
 // #[cfg(feature = "cufft")]
 // use crate::cufft;
 // #[cfg(feature = "vkfft")]
@@ -16,7 +17,6 @@ use crate::{
     fft::{exec_forward, exec_inverse},
     self_energy,
 };
-use crate::fft::destroy_plan;
 
 /// Group GPU-specific state, so they can be made an option as a whole, in the case
 /// of compiling with GPU support, but no stream is available.
@@ -108,10 +108,19 @@ impl PmeRecip {
             &pos_dev,
             &q_dev,
             &mut rho_real_dev,
+            posits.len() as u32,
             self.plan_dims,
             self.box_dims,
-            posits.len() as u32,
         );
+
+        {
+            let rho_real = stream.memcpy_dtov(&rho_real_dev).unwrap();
+            println!("\n");
+            for i in 0..10 {
+                println!("POSITS: {:?} Q: {:.3}", posits[i], q[i]);
+                println!("rho real GPU pre fwd FFT: {:?}", rho_real[i])
+            }
+        }
 
         // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
@@ -194,7 +203,7 @@ impl PmeRecip {
             self.alpha,
         );
 
-        let mut energy: f64 = stream
+        let energy: f64 = stream
             .memcpy_dtov(&out_partial_gpu)
             .unwrap()
             .into_iter()
@@ -316,22 +325,6 @@ pub(crate) fn cuda_slice_to_ptr_mut<T>(
     p as *mut c_void
 }
 
-pub(crate) fn split3(
-    buf: &CudaSlice<f32>,
-    len: usize,
-    stream: &Arc<CudaStream>,
-) -> (*mut c_void, *mut c_void, *mut c_void) {
-    let (base, _) = buf.device_ptr(stream);
-    let base = base as usize;
-
-    let stride = len * size_of::<f32>();
-    (
-        base as *mut c_void,
-        (base + stride) as *mut c_void,
-        (base + 2 * stride) as *mut c_void,
-    )
-}
-
 /// Launch the GPU kernel that spreads charges.
 /// todo note: Getting the same values as on CPU here.
 fn spread_charges(
@@ -341,9 +334,9 @@ fn spread_charges(
     pos_dev: &CudaSlice<f32>,
     q_dev: &CudaSlice<f32>,
     rho_dev: &mut CudaSlice<f32>, // real only.
+    n_posits: u32,
     plan_dims: (usize, usize, usize),
     box_dims: (f32, f32, f32),
-    n_posits: u32,
 ) {
     let (nx, ny, nz) = plan_dims;
     let nx_i = nx as i32;
@@ -443,7 +436,7 @@ fn energy_half_spectrum(
     let n = (nx * ny * (nz / 2 + 1)) as i32;
 
     let block: u32 = 256;
-    let grid: u32 = ((n as u32) + block - 1) / block;
+    // let grid: u32 = ((n as u32) + block - 1) / block;
 
     // let cfg = LaunchConfig::for_num_elems(n as u32);
     let cfg = launch_cfg(n as u32, 256);

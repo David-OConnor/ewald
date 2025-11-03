@@ -6,6 +6,8 @@
 
 // Note: We use float2 instead of cufftComplex, as it doesn't rely on cuFFT.
 
+const int32_t SPLINE_ORDER = 4;
+
 __device__ __forceinline__
 int wrap(int32_t a, int32_t n) {
     a %= n; return (a < 0) ? a + n : a;
@@ -35,7 +37,8 @@ void bspline4_weights(float s, int32_t* i0, float w[4]) {
     w[3] = w3;
 }
 
-// Kernel for charge spreading. Corresponds directly to a equivalent CPU function.
+// Kernel for charge spreading. Z as the fast/contiguous axis.
+// Corresponds directly to a equivalent CPU function.
 extern "C" __global__
 void spread_charges(
     const float3* pos,
@@ -52,7 +55,7 @@ void spread_charges(
     size_t i0 = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
-    size_t nxny = nx * ny;
+    size_t nynz = ny * nz;
 
     for (size_t i = i0; i < (size_t)n_atoms; i += stride) {
         float3 r = pos[i];
@@ -62,7 +65,7 @@ void spread_charges(
         float sz = r.z / lz * nz;
 
         int32_t ix0, iy0, iz0;
-        float wx[4], wy[4], wz[4];
+        float wx[SPLINE_ORDER], wy[SPLINE_ORDER], wz[SPLINE_ORDER];
 
         bspline4_weights(sx, &ix0, wx);
         bspline4_weights(sy, &iy0, wy);
@@ -70,18 +73,18 @@ void spread_charges(
 
         float qi = q[i];
 
-        for (int32_t a=0; a<4; a++) {
+        for (int32_t a=0; a < SPLINE_ORDER; a++) {
             int32_t ix = wrap(ix0 + a, nx);
             float wxa = wx[a];
 
-            for (int32_t b=0; b<4; b++) {
+            for (int32_t b=0; b < SPLINE_ORDER; b++) {
                 int32_t iy = wrap(iy0 + b, ny);
                 float wxy = wxa * wy[b];
 
                 // Z-fast base for this (ix,iy) column
-                size_t base = (size_t)ix * (size_t)(ny * nz) + (size_t)iy * (size_t)nz;
+                size_t base = (size_t)ix * nynz + (size_t)iy * (size_t)nz;
 
-                for (int32_t c=0; c<4; c++) {
+                for (int32_t c=0; c < SPLINE_ORDER; c++) {
                     int32_t iz = wrap(iz0 + c, nz);
                     size_t idx = base + (size_t)iz; // contiguous over z
                     atomicAdd(&rho[idx], qi * wxy * wz[c]);

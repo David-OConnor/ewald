@@ -1,10 +1,7 @@
 //! CPU FFT setup
 
 #[cfg(feature = "cuda")]
-use std::{
-    sync::Arc,
-    ffi::c_void,
-};
+use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, CudaStream};

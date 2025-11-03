@@ -12,26 +12,21 @@
 
 extern crate core;
 
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 use std::{
     arch::x86_64::{_CMP_LT_OQ, _mm256_blendv_ps, _mm256_cmp_ps, _mm256_set1_ps},
     f32::consts::{PI, TAU},
 };
-#[cfg(feature = "cuda")]
-use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cuda")]
 use cudarc::{
-    driver::{CudaContext, CudaStream, DevicePtr},
+    driver::{CudaContext, CudaStream},
     nvrtc::Ptx,
 };
 
 // We are for now, exposing
 mod fft;
-
-// #[cfg(feature = "cufft")]
-// mod cufft;
-// #[cfg(feature = "vkfft")]
-// pub mod vk_fft;
 
 #[cfg(feature = "cuda")]
 mod gpu_shared;
@@ -139,23 +134,15 @@ impl PmeRecip {
                         GpuTables::new(k, bmod2, s)
                     };
 
-
                     // let planner_gpu = cufft::create_gpu_plan(plan_dims, s);
 
                     #[cfg(feature = "cuda")]
                     let planner_gpu = fft::create_gpu_plan(plan_dims, s);
 
-                    // #[cfg(feature = "vkfft")]
-                    // let vk_ctx = Arc::new(vk_fft::VkContext::default());
-                    // #[cfg(feature = "vkfft")]
-                    // let planner_gpu = vk_fft::create_gpu_plan(plan_dims, &vk_ctx, s);
-
                     Some(GpuData {
                         planner_gpu,
                         gpu_tables,
                         kernels,
-                        // #[cfg(feature = "vkfft")]
-                        // vk_ctx,
                     })
                 }
                 Err(_) => None,
@@ -240,6 +227,7 @@ impl PmeRecip {
         self.spread_charges(posits, q, &mut rho_real);
 
         // for i in 0..10 {
+        //     println!("POSITS: {:?} Q: {:.3}", posits[i], q[i]);
         //     println!("rho CPU pre fwd FFT: {:?}", rho_real[i])
         // }
 
