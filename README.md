@@ -6,6 +6,9 @@
 
 [//]: # ([![DOI]&#40;https://zenodo.org/badge/DOI/10.5281/zenodo.15616833.svg&#41;]&#40;https://doi.org/10.5281/zenodo.15616833&#41;)
 
+
+[Home page](https://www.athanorlab.com/rust-tools)
+
 [Original paper describing the SPME method, by Essmann et al.](https://biomolmd.org/mw/images/e/e0/Spme.pdf)
 
 Compute Coulomb forces for systems with periodic boundary conditions in an efficient, accurate way. Forces are broken

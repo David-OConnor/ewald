@@ -113,14 +113,14 @@ impl PmeRecip {
             self.box_dims,
         );
 
-        {
-            let rho_real = stream.memcpy_dtov(&rho_real_dev).unwrap();
-            println!("\n");
-            for i in 0..10 {
-                println!("POSITS: {:?} Q: {:.3}", posits[i], q[i]);
-                println!("rho real GPU pre fwd FFT: {:?}", rho_real[i])
-            }
-        }
+        // {
+        //     let rho_real = stream.memcpy_dtov(&rho_real_dev).unwrap();
+        //     println!("\n");
+        //     for i in 0..10 {
+        //         println!("POSITS: {:?} Q: {:.3}", posits[i], q[i]);
+        //         println!("rho real GPU pre fwd FFT: {:?}", rho_real[i])
+        //     }
+        // }
 
         // Convert the spread charges to K space. They will be complex, and in the frequency domain.
         unsafe {
@@ -131,18 +131,18 @@ impl PmeRecip {
             );
         }
 
-        {
-            let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
-            let mut rho_dbg = Vec::new();
-            for i in 0..complex_len / 2 {
-                rho_dbg.push(Complex::<f32>::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
-            }
-
-            println!("\n");
-            for i in 220..230 {
-                println!("rho GPU post fwd FFT: {:?}", rho_dbg[i])
-            }
-        }
+        // {
+        //     let rho_cpu = stream.memcpy_dtov(&rho_dev).unwrap();
+        //     let mut rho_dbg = Vec::new();
+        //     for i in 0..complex_len / 2 {
+        //         rho_dbg.push(Complex::<f32>::new(rho_cpu[2 * i], rho_cpu[2 * i + 1]));
+        //     }
+        //
+        //     println!("\n");
+        //     for i in 220..230 {
+        //         println!("rho GPU post fwd FFT: {:?}", rho_dbg[i])
+        //     }
+        // }
 
         // todo: Pre-allocate these instead of every step?
         // Contiguous complex buffer: [exk | eyk | ezk]
