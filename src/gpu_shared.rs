@@ -199,7 +199,8 @@ impl PmeRecip {
         );
 
         let energy: f64 = stream
-            .clone_htod(&out_partial_gpu)
+            .clone_dtoh(&out_partial_gpu)
+            // .memcpy_dtov(&out_partial_gpu)
             .unwrap()
             .into_iter()
             .sum();
