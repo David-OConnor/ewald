@@ -7,14 +7,9 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfi
 use lin_alg::f32::{Vec3, vec3s_to_dev};
 use rustfft::num_complex::Complex;
 
-use crate::fft::destroy_plan;
-// #[cfg(feature = "cufft")]
-// use crate::cufft;
-// #[cfg(feature = "vkfft")]
-// use crate::vk_fft;
 use crate::{
     PmeRecip,
-    fft::{exec_forward, exec_inverse},
+    fft::{exec_forward, exec_inverse, destroy_plan},
     self_energy,
 };
 
@@ -52,12 +47,12 @@ impl GpuTables {
         stream: &Arc<CudaStream>,
     ) -> Self {
         Self {
-            kx: stream.memcpy_stod(k.0).unwrap(),
-            ky: stream.memcpy_stod(k.1).unwrap(),
-            kz: stream.memcpy_stod(k.2).unwrap(),
-            bx: stream.memcpy_stod(bmod2.0).unwrap(),
-            by: stream.memcpy_stod(bmod2.1).unwrap(),
-            bz: stream.memcpy_stod(bmod2.2).unwrap(),
+            kx: stream.clone_htod(k.0).unwrap(),
+            ky: stream.clone_htod(k.1).unwrap(),
+            kz: stream.clone_htod(k.2).unwrap(),
+            bx: stream.clone_htod(bmod2.0).unwrap(),
+            by: stream.clone_htod(bmod2.1).unwrap(),
+            bz: stream.clone_htod(bmod2.2).unwrap(),
         }
     }
 }
@@ -91,7 +86,7 @@ impl PmeRecip {
         // todo: Should we init these once and store, instead of re-allocating at each step?
         // Set up positions, rho, and charge on the GPU once; they'll be used a few times in this function.
         let pos_dev = vec3s_to_dev(stream, posits);
-        let q_dev = stream.memcpy_stod(q).unwrap();
+        let q_dev = stream.clone_htod(q).unwrap();
 
         // let mut rho_real_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
         // let mut rho_cplx_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
@@ -204,7 +199,7 @@ impl PmeRecip {
         );
 
         let energy: f64 = stream
-            .memcpy_dtov(&out_partial_gpu)
+            .clone_htod(&out_partial_gpu)
             .unwrap()
             .into_iter()
             .sum();
@@ -278,7 +273,7 @@ impl PmeRecip {
         );
 
         // D2H forces
-        let f_host: Vec<f32> = stream.memcpy_dtov(&out_f_gpu).unwrap();
+        let f_host: Vec<f32> = stream.clone_dtoh(&out_f_gpu).unwrap();
 
         // todo: QC the - sign?
         let mut f = Vec::with_capacity(posits.len());
@@ -301,10 +296,6 @@ impl Drop for PmeRecip {
         };
         unsafe {
             if !data.planner_gpu.is_null() {
-                // #[cfg(feature = "vkfft")]
-                // vk_fft::destroy_plan(data.planner_gpu);
-                // #[cfg(feature = "cufft")]
-                // cufft::destroy_plan(data.planner_gpu);
                 destroy_plan(data.planner_gpu);
                 data.planner_gpu = std::ptr::null_mut();
             }
@@ -387,8 +378,7 @@ fn apply_ghat_and_grad(
 
     let n = nx * ny * (nz / 2 + 1);
     let n_real = (nx * ny * nz) as i32;
-
-    // let cfg = LaunchConfig::for_num_elems(n as u32);
+    
     let cfg = launch_cfg(n as u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
