@@ -223,7 +223,6 @@ impl PmeRecip {
 
         // Charge density.
         let mut rho_real = vec![0.; n_real];
-
         self.spread_charges(posits, q, &mut rho_real);
 
         // for i in 0..10 {
@@ -244,7 +243,10 @@ impl PmeRecip {
         let mut eyk = vec![Complex::new(0.0, 0.0); n_k];
         let mut ezk = vec![Complex::new(0.0, 0.0); n_k];
 
-        let mut energy = self.apply_ghat_and_grad(&rho, &mut exk, &mut eyk, &mut ezk, ny, nzc);
+        // let mut energy = self.apply_ghat_and_grad(&rho, &mut exk, &mut eyk, &mut ezk, ny, nzc);
+
+        let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
+        let mut energy = self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
 
         energy += self_energy(q, self.alpha);
 
@@ -272,8 +274,17 @@ impl PmeRecip {
         //     println!("eyk CPU post inv FFT: {:?}", ey[i])
         // }
 
-        // todo: QC the minus sign?
-        let f = gather_forces_to_atoms(posits, q, &ex, &ey, &ez, self.plan_dims, self.box_dims);
+        // let f = gather_forces_to_atoms(posits, q, &ex, &ey, &ez, self.plan_dims, self.box_dims);
+
+
+        // 4. Inverse FFT (Complex -> Real) to get Scalar Potential Grid
+        let mut phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
+
+        // 5. FFT Normalization
+        //    IFFT(FFT(x)) = N * x. We must divide by N to get the actual potential values.
+        let grid_size = (nx * ny * nz) as f32;
+        phi_real.par_iter_mut().for_each(|x| *x /= grid_size);
+        let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
 
         (f, energy as f32)
     }
@@ -283,7 +294,7 @@ impl PmeRecip {
     /// Fourier space to get the electric field.
     ///
     /// Also computes the half-spectrum energy.
-    fn apply_ghat_and_grad(
+    fn apply_ghat_and_grad_(
         &self,
         rho: &[Complex_],
         exk: &mut [Complex_],
@@ -348,6 +359,57 @@ impl PmeRecip {
             })
             .sum()
     }
+
+    // experimenting
+    fn apply_ghat_and_compute_potential(
+        &self,
+        rho: &[Complex_],
+        phi_k: &mut [Complex_], // Only one output buffer needed now
+        ny: usize,
+        nzc: usize,
+    ) -> f64 {
+        let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
+        let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
+        let (vol, alpha) = (self.vol, self.alpha);
+
+        phi_k.par_iter_mut()
+            .zip(rho.par_iter())
+            .enumerate()
+            .map(|(idx, (phi, &rho_val))| {
+                // ... [Index calculation lines are fine] ...
+                let izc = idx % nzc;
+                let iy = (idx / nzc) % ny;
+                let ix = idx / (nzc * ny);
+
+                let kxv = kx[ix];
+                let kyv = ky[iy];
+                let kzv = kz[izc];
+
+                let k2 = kxv.mul_add(kxv, kyv.mul_add(kyv, kzv * kzv));
+
+                // Handle k=0 or small bmod
+                if k2 == 0.0 || bx[ix] * by[iy] * bz[izc] <= 1e-10 {
+                    *phi = Complex::new(0.0, 0.0);
+                    return 0.0;
+                }
+
+                let bmod2 = bx[ix] * by[iy] * bz[izc];
+                const TWO_TAU: f32 = 2. * std::f32::consts::TAU;
+
+                // Calculate Influence Function
+                let ghat = (TWO_TAU / vol) * (-k2 / (4.0 * alpha * alpha)).exp() / (k2 * bmod2);
+
+                // Apply to get Potential in K-space
+                let val = rho_val * ghat;
+                *phi = val;
+
+                // Energy = 0.5 * Re(rho * phi*)
+                // Note: conjugate logic.
+                // rho * (rho * ghat).conj = rho * rho.conj * ghat = |rho|^2 * ghat (since ghat is real)
+                0.5 * (rho_val.re as f64 * val.re as f64 + rho_val.im as f64 * val.im as f64)
+            })
+            .sum()
+    }
 }
 
 /// k-array for an orthorhombic cell; FFT index convention → physical wavevector.
@@ -409,6 +471,35 @@ fn bspline4_weights(s: f32) -> (isize, [f32; SPLINE_ORDER]) {
     let w3 = u3 / 6.0;
 
     (i0, [w0, w1, w2, w3])
+}
+
+// experimenting
+/// Returns (index, weights, derivative_weights)
+fn bspline4_weights_and_derivs(s: f32) -> (isize, [f32; 4], [f32; 4]) {
+    let sfloor = s.floor();
+    let u = s - sfloor;
+    let i0 = sfloor as isize - 1;
+
+    let u2 = u * u;
+    let u3 = u2 * u;
+
+    // Standard Weights
+    let w0 = (1.0 - u).powi(3) / 6.0;
+    let w1 = (3.0 * u3 - 6.0 * u2 + 4.0) / 6.0;
+    let w2 = (-3.0 * u3 + 3.0 * u2 + 3.0 * u + 1.0) / 6.0;
+    let w3 = u3 / 6.0;
+
+    // Derivatives w.r.t u (d/du)
+    // w0' = -3(1-u)^2 / 6 = -0.5 * (1-u)^2
+    let dw0 = -0.5 * (1.0 - u).powi(2);
+    // w1' = (9u^2 - 12u) / 6 = 1.5u^2 - 2u
+    let dw1 = 1.5 * u2 - 2.0 * u;
+    // w2' = (-9u^2 + 6u + 3) / 6 = -1.5u^2 + u + 0.5
+    let dw2 = -1.5 * u2 + u + 0.5;
+    // w3' = 3u^2 / 6 = 0.5 u^2
+    let dw3 = 0.5 * u2;
+
+    (i0, [w0, w1, w2, w3], [dw0, dw1, dw2, dw3])
 }
 
 fn wrap(i: isize, n: usize) -> usize {
@@ -576,7 +667,7 @@ fn self_energy(q: &[f32], alpha: f32) -> f64 {
 }
 
 /// Interpolate E back to particles with the same B-spline weights; F = q E
-fn gather_forces_to_atoms(
+fn gather_forces_to_atoms_(
     posits: &[Vec3],
     q: &[f32],
     ex: &[f32],
@@ -633,6 +724,75 @@ fn gather_forces_to_atoms(
             }
         })
         .collect()
+}
+
+// todo: Experimenting
+fn gather_forces_from_potential(
+    posits: &[Vec3],
+    q: &[f32],
+    phi_grid: &[f32], // This is the scalar potential grid (real space)
+    plan_dims: (usize, usize, usize),
+    box_dims: (f32, f32, f32),
+) -> Vec<Vec3> {
+    let (nx, ny, nz) = plan_dims;
+    let (lx, ly, lz) = box_dims;
+
+    // Chain rule scaling factors: du/dx = N/L
+    let fx_scl = nx as f32 / lx;
+    let fy_scl = ny as f32 / ly;
+    let fz_scl = nz as f32 / lz;
+
+    posits.par_iter().enumerate().map(|(i, &r)| {
+        let (ix0, wx, dwx) = bspline4_weights_and_derivs(r.x * fx_scl);
+        let (iy0, wy, dwy) = bspline4_weights_and_derivs(r.y * fy_scl);
+        let (iz0, wz, dwz) = bspline4_weights_and_derivs(r.z * fz_scl);
+
+        let mut f_x = 0.0f64;
+        let mut f_y = 0.0f64;
+        let mut f_z = 0.0f64;
+
+        for a in 0..4 {
+            let ix = wrap(ix0 + a as isize, nx);
+
+            for b in 0..4 {
+                let iy = wrap(iy0 + b as isize, ny);
+
+                // Precompute combined weights for outer loops
+                let w_xy = wx[a] * wy[b];
+                let dw_xy = dwx[a] * wy[b]; // for Fx
+                let w_dxy = wx[a] * dwy[b]; // for Fy
+
+                // Base index for Z-column
+                let base_idx = ix * (ny * nz) + iy * nz;
+
+                for c in 0..4 {
+                    let iz = wrap(iz0 + c as isize, nz);
+                    let idx = base_idx + iz;
+
+                    let potential = phi_grid[idx] as f64;
+
+                    // Fx component: phi * dwx * wy * wz
+                    f_x += potential * (dw_xy * wz[c]) as f64;
+
+                    // Fy component: phi * wx * dwy * wz
+                    f_y += potential * (w_dxy * wz[c]) as f64;
+
+                    // Fz component: phi * wx * wy * dwz
+                    f_z += potential * (w_xy * dwz[c]) as f64;
+                }
+            }
+        }
+
+        let qi = q[i] as f64;
+
+        // F = -q * Gradient.
+        // Gradient = (sum) * (N/L).
+        Vec3 {
+            x: (-f_x * qi * fx_scl as f64) as f32,
+            y: (-f_y * qi * fy_scl as f64) as f32,
+            z: (-f_z * qi * fz_scl as f64) as f32,
+        }
+    }).collect()
 }
 
 /// A utility fn. todo: QC this.
