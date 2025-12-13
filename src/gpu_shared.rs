@@ -9,7 +9,7 @@ use rustfft::num_complex::Complex;
 
 use crate::{
     PmeRecip,
-    fft::{exec_forward, exec_inverse, destroy_plan},
+    fft::{destroy_plan, exec_forward, exec_inverse},
     self_energy,
 };
 
@@ -124,6 +124,9 @@ impl PmeRecip {
                 cuda_slice_to_ptr_mut(&rho_real_dev, stream),
                 cuda_slice_to_ptr_mut(&rho_dev, stream),
             );
+
+            // #[cfg(feature = "cufft")]
+            // exec_r2c(data.planner_gpu, &rho_real_dev, &rho_dev);
         }
 
         // {
@@ -227,6 +230,10 @@ impl PmeRecip {
                 ey_ptr,
                 ez_ptr,
             );
+
+            // todo: QC this
+            // #[cfg(feature = "cufft")]
+            // cudarc::cufft::exec_c2r(data.planner_gpu, &ex_ptr, &ex_ptr);
         }
 
         // {
@@ -379,7 +386,7 @@ fn apply_ghat_and_grad(
 
     let n = nx * ny * (nz / 2 + 1);
     let n_real = (nx * ny * nz) as i32;
-    
+
     let cfg = launch_cfg(n as u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
