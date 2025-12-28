@@ -43,7 +43,7 @@ This uses Rayon to parallelize computations in thread pools. Support for SIMD (2
 either the `cufft` or `vkfft`  feature in `Cargo.toml`. We use these GPU FFT libraries to compute. Note that they both
 use the Cuda driver internally; VKFFT is configured with a Cuda backend. **VkFFT is currently broken; don't use it**.
 
-Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
+Used by the [ChemForma protein viewer and molecular dynamics program](https://github.com/david-oconnor/chemforma), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
 Uses `f32` for Coulomb interactions. Energy sums are computed as `f64`.

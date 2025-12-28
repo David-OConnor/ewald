@@ -96,6 +96,7 @@ void spread_charges(
 
 
 // A kernel. Apply G(k) and gradient to get Exk/Eyk/Ezk
+// todo: Deprecated in favor of the *compute potential* version.
 extern "C" __global__
 void apply_ghat_and_grad(
     const float2* rho,
@@ -169,6 +170,78 @@ void apply_ghat_and_grad(
     if (rim_x) exk[idx].x = 0.0f;
     if (rim_y) eyk[idx].x = 0.0f;
     if (rim_z) ezk[idx].x = 0.0f;
+}
+
+// A kernel. Apply G(k) to get phi_k, and (optionally) write per-mode energy for reduction.
+extern "C" __global__
+void apply_ghat_and_compute_potential(
+    const float2* rho,
+    float2* phi_k,
+    //
+    const float* kx,
+    const float* ky,
+    const float* kz,
+    //
+    const float* bx,
+    const float* by,
+    const float* bz,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float vol,
+    float alpha,
+    //
+    double* energy_out // may be null; if non-null, energy_out[idx] = 0.5 * Re(rho * phi_k*)
+) {
+    int32_t idx = (int32_t)(blockIdx.x * blockDim.x + threadIdx.x);
+
+    int32_t nzc = nz / 2 + 1;
+    int32_t n_cmplx = nx * ny * nzc;
+    if (idx >= n_cmplx) return;
+
+    int32_t iz = idx % nzc;
+    int32_t iy = (idx / nzc) % ny;
+    int32_t ix = idx / (nzc * ny);
+
+    float kxv = kx[ix];
+    float kyv = ky[iy];
+    float kzv = kz[iz];
+
+    float k2 = fmaf(kxv, kxv, fmaf(kyv, kyv, kzv * kzv));
+
+    float bmod2 = bx[ix] * by[iy] * bz[iz];
+
+    if (k2 == 0.0f || bmod2 <= 1e-10f) {
+        phi_k[idx].x = 0.0f;
+        phi_k[idx].y = 0.0f;
+        if (energy_out) energy_out[idx] = 0.0;
+        return;
+    }
+
+    const float TWO_TAU = 12.56637061435917295385f; // 4π
+
+    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) / (k2 * bmod2);
+
+    float2 rho_v = rho[idx];
+
+    float2 val;
+    val.x = rho_v.x * ghat;
+    val.y = rho_v.y * ghat;
+
+    // Enforce self-conjugate points to be purely real (numerical cleanup).
+    const bool rim_x = (ix == 0) || (((nx & 1) == 0) && (ix == (nx / 2)));
+    const bool rim_y = (iy == 0) || (((ny & 1) == 0) && (iy == (ny / 2)));
+    const bool rim_z = (iz == 0) || (((nz & 1) == 0) && (iz == (nz / 2)));
+    if (rim_x && rim_y && rim_z) {
+        val.y = 0.0f;
+    }
+
+    phi_k[idx] = val;
+
+    if (energy_out) {
+        // 0.5 * (rho.re * val.re + rho.im * val.im)
+        energy_out[idx] = 0.5 * ((double)rho_v.x * (double)val.x + (double)rho_v.y * (double)val.y);
+    }
 }
 
 

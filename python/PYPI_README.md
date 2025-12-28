@@ -18,7 +18,7 @@ instead.
 Uses Rayon to parallelize as thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable
 the `cuda` feature in `Cargo.toml`.
 
-Used by the [Daedalus protein viewer and molecular dynamics program](https://github.com/david-oconnor/daedalus), and
+Used by the [ChemForma protein viewer and molecular dynamics program](https://github.com/david-oconnor/chemforma), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).
 
 Uses f32 for Lennard Jones and Coulomb interactions. Energy sums are computed as f64.
