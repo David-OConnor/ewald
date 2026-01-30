@@ -337,7 +337,7 @@ impl PmeRecip {
                 *phi = val;
 
                 let mut local_energy =
-                    (rho_val.re as f64 * val.re as f64 + rho_val.im as f64 * val.im as f64);
+                    rho_val.re as f64 * val.re as f64 + rho_val.im as f64 * val.im as f64;
 
                 if izc > 0 && izc < (nzc - 1) {
                     local_energy *= 2.0;

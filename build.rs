@@ -65,16 +65,12 @@ fn main() {
         println!("cargo:warning=Needs build {needs_rebuild}");
 
         if needs_rebuild {
-            // if false {
             cc::Build::new()
                 .cuda(true)
                 .files(["src/cuda/vk_fft.cu"])
                 .define("VKFFT_BACKEND", Some("1")) //  Sets the backend to CUDA
-                // .define("_CRT_SECURE_NO_WARNINGS", None)
-                // .include("src/cuda")
                 .include("third_party/VkFFT/vkFFT")
                 .flag_if_supported("-O3")
-                // .warnings(false)
                 .compile("vk_fft");
 
             // copy from OUT_DIR to stable cache so next build is fast

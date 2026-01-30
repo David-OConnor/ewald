@@ -5,7 +5,6 @@ use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use lin_alg::f32::{Vec3, vec3s_to_dev};
-use rustfft::num_complex::Complex;
 
 use crate::{
     PmeRecip,
@@ -311,7 +310,7 @@ impl Drop for PmeRecip {
     }
 }
 
-pub(crate) fn cuda_slice_to_ptr<T>(buf: &CudaSlice<T>, stream: &Arc<CudaStream>) -> *const c_void {
+pub(crate) fn _cuda_slice_to_ptr<T>(buf: &CudaSlice<T>, stream: &Arc<CudaStream>) -> *const c_void {
     let (p, _) = buf.device_ptr(stream);
     p as *const c_void
 }
@@ -433,7 +432,7 @@ fn energy_half_spectrum(
 
     let n = (nx * ny * (nz / 2 + 1)) as i32;
 
-    let block: u32 = 256;
+    // let block: u32 = 256;
     // let grid: u32 = ((n as u32) + block - 1) / block;
 
     // let cfg = LaunchConfig::for_num_elems(n as u32);

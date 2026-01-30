@@ -4,13 +4,13 @@
 use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::CudaStream;
 use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 
 use crate::Complex_;
-#[cfg(feature = "cuda")]
-use crate::gpu_shared::cuda_slice_to_ptr_mut;
+// #[cfg(feature = "cuda")]
+// use crate::gpu_shared::cuda_slice_to_ptr_mut;
 
 /// Real-to-Complex forward 3D FFT. This approach uses less memory, and is probably faster,
 /// than using complex to complex transform (Factor of 2 for the memory).

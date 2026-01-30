@@ -30,10 +30,10 @@ realfft = "3.5.0"
 
 rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-cudarc = { version = "0.18.1", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13000"], optional=true }
-[target.'cfg(target_os = "windows")'.dependencies]
-cudarc = { version = "0.18.1", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13000"], optional=true }
+#[target.'cfg(not(target_os = "windows"))'.dependencies]
+cudarc = { version = "0.19.0", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13000"], optional=true }
+#[target.'cfg(target_os = "windows")'.dependencies]
+#cudarc = { version = "0.18.1", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13000"], optional=true }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.9", optional = true }
