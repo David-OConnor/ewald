@@ -1,6 +1,6 @@
 [package]
 name = "ewald"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 authors = ["David O'Connor <the_alchemist@fastmail.com>"]
 description = "Ewald SPME force calculations"
@@ -8,8 +8,9 @@ keywords = ["n-body", "biology", "chemistry", "barnes", "dynamics"]
 categories = [
     "algorithms",
     "mathematics",
-    "science",
-    "algorithms",
+    "science::computational-biology::structural-modeling",
+    "science::computational-chemistry::cheminformatics",
+    "science::computational-chemistry::molecular-simulation",
 ]
 repository = "https://github.com/David-OConnor/ewald"
 documentation = "https://docs.rs/ewald"
