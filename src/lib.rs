@@ -370,25 +370,42 @@ fn make_k_array(n: usize, L: f32) -> Vec<f32> {
     out
 }
 
-// todo: Updated Dec 2025
-/// |B(k)|^2 for Cardinal B-splines of order 4 (PME deconvolution).
-/// Use signed/wrapped index distance to 0 to avoid over-amplifying near the Nyquist frequency.
+/// Exact |B(k)|^-2 for Cardinal B-splines of order m (PME deconvolution factor).
+///
+/// Derived from Essmann et al. (1995) eq. 4.4. The modulus is the squared magnitude
+/// of the DFT of the B-spline evaluated at integer points:
+///   |b_m(k)|^2 = |Σ_{j=0}^{m-2}  M_m(j+1) * exp(2πi·j·k/n)|^2
+///
+/// For order 4: M_4(1)=1/6, M_4(2)=4/6, M_4(3)=1/6, giving the closed form:
+///   |b_4(k)|^2 = ((4 + 2·cos(2πk/n)) / 6)^2
+///
+/// We store 1/|b|^2 for use in the influence function G(k).
 fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
     assert!(m >= 1);
-    let mut v = vec![0.0; n];
+    // Integer-point values of the cardinal B-spline M_m, for j = 1..m-1.
+    // (M_m is zero at j=0 and j=m, so these are all non-zero entries.)
+    // For m=4: [M_4(1), M_4(2), M_4(3)] = [1/6, 4/6, 1/6]
+    let bspline_ints: &[f32] = match m {
+        4 => &[1.0 / 6.0, 4.0 / 6.0, 1.0 / 6.0],
+        3 => &[0.5, 0.5],
+        5 => &[1.0 / 24.0, 11.0 / 24.0, 11.0 / 24.0, 1.0 / 24.0],
+        _ => panic!("Unsupported B-spline order {m}; add its integer-point values above."),
+    };
 
+    let mut v = vec![0.0f32; n];
     for k in 0..n {
-        // Use |k| in the FFT sense: k and (n-k) represent +/- the same mode.
-        let kk = k.min(n - k);
-
-        let t = PI * (kk as f32) / (n as f32); // = ω/2 with ω = 2π|k|/n
-
-        let s = if kk == 0 { 1.0 } else { t.sin() / t };
-
-        let b2 = s.powi((2 * m) as i32).max(1e-12); // |B|^2
+        // |b_m(k)|^2 = |Σ_j  bspline_ints[j] * exp(2πi·j·k/n)|^2
+        let theta = TAU * k as f32 / n as f32;
+        let mut re = 0.0f32;
+        let mut im = 0.0f32;
+        for (j, &val) in bspline_ints.iter().enumerate() {
+            let phase = theta * j as f32;
+            re += val * phase.cos();
+            im += val * phase.sin();
+        }
+        let b2 = (re * re + im * im).max(1e-12);
         v[k] = 1.0 / b2; // store 1/|B|^2
     }
-
     v
 }
 
