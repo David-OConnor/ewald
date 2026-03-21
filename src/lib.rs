@@ -68,9 +68,9 @@ pub struct PmeRecip {
     kx: Vec<f32>,
     ky: Vec<f32>,
     kz: Vec<f32>,
-    bmod2_x: Vec<f32>,
-    bmod2_y: Vec<f32>,
-    bmod2_z: Vec<f32>,
+    bmod_sq_inv_x: Vec<f32>,
+    bmod_sq_inv_y: Vec<f32>,
+    bmod_sq_inv_z: Vec<f32>,
     /// For CPU FFTs
     planner: FftPlanner<f32>,
     /// For GPU FFTs. None if compiling with GPU support, but there is a runtime problem,
@@ -94,9 +94,9 @@ impl PmeRecip {
         let ky = make_k_array(plan_dims.1, l.1);
         let kz = make_k_array(plan_dims.2, l.2);
 
-        let bmod2_x = spline_bmod2_1d(plan_dims.0, SPLINE_ORDER);
-        let bmod2_y = spline_bmod2_1d(plan_dims.1, SPLINE_ORDER);
-        let bmod2_z = spline_bmod2_1d(plan_dims.2, SPLINE_ORDER);
+        let bmod_sq_inv_x = spline_bmod_sq_inv_1d(plan_dims.0, SPLINE_ORDER);
+        let bmod_sq_inv_y = spline_bmod_sq_inv_1d(plan_dims.1, SPLINE_ORDER);
+        let bmod_sq_inv_z = spline_bmod_sq_inv_1d(plan_dims.2, SPLINE_ORDER);
 
         #[cfg(feature = "cuda")]
         let mut gpu_data = None;
@@ -125,7 +125,7 @@ impl PmeRecip {
 
                     let gpu_tables = {
                         let k = (&kx, &ky, &kz);
-                        let bmod2 = (&bmod2_x, &bmod2_y, &bmod2_z);
+                        let bmod2 = (&bmod_sq_inv_x, &bmod_sq_inv_y, &bmod_sq_inv_z);
 
                         GpuTables::new(k, bmod2, s)
                     };
@@ -156,9 +156,9 @@ impl PmeRecip {
             kx,
             ky,
             kz,
-            bmod2_x,
-            bmod2_y,
-            bmod2_z,
+            bmod_sq_inv_x,
+            bmod_sq_inv_y,
+            bmod_sq_inv_z,
             planner: FftPlanner::new(),
             #[cfg(feature = "cuda")]
             gpu_data,
@@ -219,66 +219,19 @@ impl PmeRecip {
         let mut rho_real = vec![0.; n_real];
         self.spread_charges(posits, q, &mut rho_real);
 
-        // for i in 0..10 {
-        //     println!("POSITS: {:?} Q: {:.3}", posits[i], q[i]);
-        //     println!("rho CPU pre fwd FFT: {:?}", rho_real[i])
-        // }
-
         // Convert spread charges to K space
         let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
-
-        // for i in 220..230 {
-        //     println!("rho CPU post fwd FFT: {:?}", rho[i])
-        // }
-
-        // eAk are per-dimension phase factors.
-        // Apply influence function to get φ(k) from ρ(k), then make E(k)=i k φ(k)
-        // let mut exk = vec![Complex::new(0.0, 0.0); n_k];
-        // let mut eyk = vec![Complex::new(0.0, 0.0); n_k];
-        // let mut ezk = vec![Complex::new(0.0, 0.0); n_k];
-
-        // let mut energy = self.apply_ghat_and_grad(&rho, &mut exk, &mut eyk, &mut ezk, ny, nzc);
 
         let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
         let mut energy = self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
 
         energy += self_energy(q, self.alpha);
 
-        // println!("\n");
-        // println!("Energy CPU: {:?}", energy);
-        //
-        // for i in 220..230 {
-        //     println!("exk post ghat: {:?}", exk[i])
-        // }
-        // for i in 220..230 {
-        //     println!("eyk post ghat: {:?}", eyk[i])
-        // }
-        // println!("\n");
-
-        // Inverse FFT to real-space E grids (C2R)
-        // let ex = fft3d_c2r(&mut exk, self.plan_dims, &mut self.planner);
-        // let ey = fft3d_c2r(&mut eyk, self.plan_dims, &mut self.planner);
-        // let ez = fft3d_c2r(&mut ezk, self.plan_dims, &mut self.planner);
-
-        // todo
-
-        // for i in 220..230 {
-        //     println!("exk CPU post inv FFT: {:?}", ex[i])
-        // }
-        // println!("\n");
-        // for i in 220..230 {
-        //     println!("eyk CPU post inv FFT: {:?}", ey[i])
-        // }
-
-        // let f = gather_forces_to_atoms(posits, q, &ex, &ey, &ez, self.plan_dims, self.box_dims);
-
-        // 4. Inverse FFT (Complex -> Real) to get Scalar Potential Grid
+        // Inverse FFT (Complex -> Real) to get Scalar Potential Grid.
+        // No /N normalization: ghat encodes 1/V so IFFT(ghat * rho_k) gives
+        // the physical potential directly (unnormalized IFFT convention).
         let mut phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
 
-        // 5. FFT Normalization
-        //    IFFT(FFT(x)) = N * x. We must divide by N to get the actual potential values.
-        let grid_size = (nx * ny * nz) as f32;
-        phi_real.par_iter_mut().for_each(|x| *x /= grid_size);
         let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
 
         (f, energy as f32)
@@ -294,7 +247,11 @@ impl PmeRecip {
     ) -> f64 {
         let (nx, _, nz) = self.plan_dims;
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
-        let (bx, by, bz) = (&self.bmod2_x, &self.bmod2_y, &self.bmod2_z);
+        let (bx, by, bz) = (
+            &self.bmod_sq_inv_x,
+            &self.bmod_sq_inv_y,
+            &self.bmod_sq_inv_z,
+        );
         let (vol, alpha) = (self.vol, self.alpha);
 
         let grid_size = (nx * ny * nz) as f64;
@@ -347,7 +304,7 @@ impl PmeRecip {
             })
             .sum();
 
-        0.5 * energy_sum / grid_size
+        0.5 * energy_sum
     }
 }
 
@@ -380,7 +337,7 @@ fn make_k_array(n: usize, L: f32) -> Vec<f32> {
 ///   |b_4(k)|^2 = ((4 + 2·cos(2πk/n)) / 6)^2
 ///
 /// We store 1/|b|^2 for use in the influence function G(k).
-fn spline_bmod2_1d(n: usize, m: usize) -> Vec<f32> {
+fn spline_bmod_sq_inv_1d(n: usize, m: usize) -> Vec<f32> {
     assert!(m >= 1);
     // Integer-point values of the cardinal B-spline M_m, for j = 1..m-1.
     // (M_m is zero at j=0 and j=m, so these are all non-zero entries.)
@@ -577,6 +534,46 @@ fn next_planner_n(mut n: usize) -> usize {
         n += 1;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the B-spline modulus values for order-4 splines at the two analytic
+    /// reference points.  `spline_bmod2_1d` stores 1/|B(k)|², so:
+    ///   k = 0:   Σ M_4(j) = 1/6 + 4/6 + 1/6 = 1 → |B(0)|² = 1 → bmod2[0] = 1
+    ///   k = N/2: Σ M_4(j)·e^{iπj} = 1/6 − 4/6 + 1/6 = −1/3 → |B(N/2)|² = 1/9 → bmod2[N/2] = 9
+    #[test]
+    fn test_bspline_bmod2_order4_known_values() {
+        let n = 16;
+        let v = spline_bmod_sq_inv_1d(n, 4);
+
+        assert!(
+            (v[0] - 1.0).abs() < 1e-5,
+            "bmod2[0] = {}, expected 1.0",
+            v[0]
+        );
+        assert!(
+            (v[n / 2] - 9.0).abs() < 1e-3,
+            "bmod2[N/2] = {}, expected 9.0",
+            v[n / 2]
+        );
+    }
+
+    /// All 1/|B|² values must be finite and positive (no degenerate modes blow up).
+    #[test]
+    fn test_bspline_bmod2_all_finite_positive() {
+        for n in [8usize, 16, 32, 50] {
+            let v = spline_bmod_sq_inv_1d(n, 4);
+            for (k, &val) in v.iter().enumerate() {
+                assert!(
+                    val.is_finite() && val > 0.0,
+                    "bmod2[{k}] = {val} is not finite/positive (n={n})"
+                );
+            }
+        }
+    }
 }
 
 /// A utility function to get the (nx, ny, nz) tuple of plan dimensions based
