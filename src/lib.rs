@@ -12,7 +12,7 @@
 
 extern crate core;
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -230,7 +230,7 @@ impl PmeRecip {
         // Inverse FFT (Complex -> Real) to get Scalar Potential Grid.
         // No /N normalization: ghat encodes 1/V so IFFT(ghat * rho_k) gives
         // the physical potential directly (unnormalized IFFT convention).
-        let mut phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
+        let phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
 
         let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
 
@@ -245,16 +245,18 @@ impl PmeRecip {
         ny: usize,
         nzc: usize,
     ) -> f64 {
-        let (nx, _, nz) = self.plan_dims;
+        // let (nx, ny, nz) = self.plan_dims;
+
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
         let (bx, by, bz) = (
             &self.bmod_sq_inv_x,
             &self.bmod_sq_inv_y,
             &self.bmod_sq_inv_z,
         );
+
         let (vol, alpha) = (self.vol, self.alpha);
 
-        let grid_size = (nx * ny * nz) as f64;
+        // let grid_size = (nx * ny * nz) as f64;
 
         let energy_sum: f64 = phi_k
             .par_iter_mut()
