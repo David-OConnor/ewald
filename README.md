@@ -40,8 +40,7 @@ a struct with forces method for long-range reciprical forces. The short range co
 and isn't appropriate to use without adding long-range forces to it.
 
 This uses Rayon to parallelize computations in thread pools. Support for SIMD (256-bit and 512-bit), is planned. To use on an nVidia GPU, enable 
-either the `cufft` or `vkfft`  feature in `Cargo.toml`. We use these GPU FFT libraries to compute. Note that they both
-use the Cuda driver internally; VKFFT is configured with a Cuda backend. **VkFFT is currently broken; don't use it**.
+either the `cufft` or `vkfft`  feature in `Cargo.toml`. We use these GPU FFT libraries to compute. Note that they both use the Cuda driver internally; VKFFT is configured with a Cuda backend. **VkFFT is currently broken; don't use it**.
 
 Used by the [ChemForma protein viewer and molecular dynamics program](https://github.com/david-oconnor/chemforma), and
 the [Dynamics library](https://github.com/david-oconnor/dynamics).
