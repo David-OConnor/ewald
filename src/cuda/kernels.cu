@@ -139,7 +139,10 @@ void apply_ghat_and_grad(
 
     const float TWO_TAU = 12.56637061435917295385f; // 4π
 
-    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) / (k2 * bmod2);
+    // bmod2 = bx*by*bz = 1/|B|² (the B-spline deconvolution factor stored as inverse).
+    // So ghat must MULTIPLY by bmod2 (= 1/|B|²), not divide.
+    // Dividing by bmod2 would be multiplying by |B|², which is the inverse of the correct factor.
+    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) * bmod2 / k2;
 
     // φ(k) = G(k) * ρ(k)
     float phi_k_real = rho[idx].x * ghat;
@@ -159,17 +162,12 @@ void apply_ghat_and_grad(
     ezk[idx].y =  kzv * phi_k_real;
 
 
-    // Self-conjugate rim handling:
-    const bool rim_x = (ix==0) || ((nx%2)==0 && ix==(nx/2));
-    const bool rim_y = (iy==0) || ((ny%2)==0 && iy==(ny/2));
-    const bool rim_z = (iz==0) || ((nz%2)==0 && iz==(nz/2));
-
-
-    // For φ(k) real on rims, E(k) should be purely imaginary after i*k multiplication.
-    // So zero the REAL parts, not the imaginary ones.
-    if (rim_x) exk[idx].x = 0.0f;
-    if (rim_y) eyk[idx].x = 0.0f;
-    if (rim_z) ezk[idx].x = 0.0f;
+    // No rim handling needed: phi(k) is Hermitian because rho_k comes from FFT of real data
+    // and ghat is real. Therefore Ex(k) = i*kx*phi(k) is automatically Hermitian, and cuFFT
+    // C2R will produce a real output without any manual correction.
+    // When kx=0 (ix=0), Ex(k) = 0 already from the formula above, so no explicit zeroing needed.
+    // Zeroing real parts for individual rim conditions (e.g. only rim_x) was incorrect because
+    // phi(k) is only purely real when ALL three indices are self-conjugate simultaneously.
 }
 
 // A kernel. Apply G(k) to get phi_k, and (optionally) write per-mode energy for reduction.
@@ -220,7 +218,8 @@ void apply_ghat_and_compute_potential(
 
     const float TWO_TAU = 12.56637061435917295385f; // 4π
 
-    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) / (k2 * bmod2);
+    // bmod2 = 1/|B|²; must multiply by it (not divide). See apply_ghat_and_grad for explanation.
+    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) * bmod2 / k2;
 
     float2 rho_v = rho[idx];
 
@@ -349,9 +348,9 @@ void energy_half_spectrum(
         float bmod2 = bx[ix]*by[iy]*bz[iz];
         if (bmod2 <= 1e-10f) continue;
 
-        // 4π/vol * exp(-k²/(4α²)) / (k² * bmod²)
+        // 4π/vol * exp(-k²/(4α²)) * bmod2 / k² where bmod2 = 1/|B|² (must multiply, not divide)
         float ghat = (2.0f*3.14159265358979323846f*2.0f / vol) *
-                     __expf(-k2/(4.0f*alpha*alpha)) / (k2*bmod2);
+                     __expf(-k2/(4.0f*alpha*alpha)) * bmod2 / k2;
 
         double a = (double)rho_k[idx].x;
         double b = (double)rho_k[idx].y;
@@ -359,7 +358,10 @@ void energy_half_spectrum(
         double phi_im = (double)ghat * b;
 
         // 1/2 * Re{ rho*(k) * phi(k) } = 1/2 * (a*phi_re + b*phi_im)
-        acc += 0.5 * (a*phi_re + b*phi_im);
+        // Interior z-modes (0 < iz < nzc-1) each represent two modes in the full
+        // spectrum (k and its conjugate -k), so they must be counted twice.
+        double weight = (iz > 0 && iz < nzc - 1) ? 2.0 : 1.0;
+        acc += weight * 0.5 * (a*phi_re + b*phi_im);
     }
 
     ssum[tid] = acc;
