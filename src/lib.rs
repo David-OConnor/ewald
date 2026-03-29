@@ -223,7 +223,7 @@ impl PmeRecip {
         let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
 
         let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
-        let mut energy = self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
+        let (mut energy, _virial) = self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
 
         energy += self_energy(q, self.alpha);
 
@@ -238,15 +238,15 @@ impl PmeRecip {
     }
 
     // todo: Updated dec 2025
+    /// Returns (energy, virial). The virial is the isotropic scalar virial W_lr derived from
+    /// the volume derivative of E_recip: W_lr = Σ_k E_k × (1 − k²/(2α²)).
     fn apply_ghat_and_compute_potential(
         &self,
         rho: &[Complex_],
         phi_k: &mut [Complex_],
         ny: usize,
         nzc: usize,
-    ) -> f64 {
-        // let (nx, ny, nz) = self.plan_dims;
-
+    ) -> (f64, f64) {
         let (kx, ky, kz) = (&self.kx, &self.ky, &self.kz);
         let (bx, by, bz) = (
             &self.bmod_sq_inv_x,
@@ -255,10 +255,9 @@ impl PmeRecip {
         );
 
         let (vol, alpha) = (self.vol, self.alpha);
+        let two_alpha_sq = 2.0 * (alpha as f64) * (alpha as f64);
 
-        // let grid_size = (nx * ny * nz) as f64;
-
-        let energy_sum: f64 = phi_k
+        let (energy_sum, virial_sum): (f64, f64) = phi_k
             .par_iter_mut()
             .zip(rho.par_iter())
             .enumerate()
@@ -275,13 +274,13 @@ impl PmeRecip {
 
                 if k2 == 0.0 {
                     *phi = Complex::new(0.0, 0.0);
-                    return 0.0;
+                    return (0.0, 0.0);
                 }
 
                 let b_inv2 = (bx[ix] * by[iy] * bz[izc]) as f64; // 1/|B|^2
                 if !b_inv2.is_finite() || b_inv2 <= 0.0 {
                     *phi = Complex::new(0.0, 0.0);
-                    return 0.0;
+                    return (0.0, 0.0);
                 }
 
                 let ghat = ((2.0 * TAU) as f64 / (vol as f64))
@@ -302,11 +301,42 @@ impl PmeRecip {
                     local_energy *= 2.0;
                 }
 
-                local_energy
-            })
-            .sum();
+                // Isotropic virial from volume derivative: W_k = E_k × (1 − k²/(2α²))
+                let virial_local = local_energy * (1.0 - k2 as f64 / two_alpha_sq);
 
-        0.5 * energy_sum
+                (local_energy, virial_local)
+            })
+            .reduce(|| (0.0, 0.0), |(e1, v1), (e2, v2)| (e1 + e2, v1 + v2));
+
+        (0.5 * energy_sum, 0.5 * virial_sum)
+    }
+
+    /// Compute reciprocal-space forces, energy, and the isotropic scalar virial on all positions,
+    /// using the CPU. Positions must be in the primary box [0,L] per axis.
+    /// The virial W_lr is the volume-derivative contribution to pressure: W = Σ_k E_k(1−k²/2α²).
+    pub fn forces_and_virial(&mut self, posits: &[Vec3], q: &[f32]) -> (Vec<Vec3>, f32, f64) {
+        let (nx, ny, nz) = self.plan_dims;
+
+        let n_real = nx * ny * nz;
+        let nzc = nz / 2 + 1;
+        let n_k = nx * ny * nzc;
+
+        let mut rho_real = vec![0.; n_real];
+        self.spread_charges(posits, q, &mut rho_real);
+
+        let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
+
+        let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
+        let (mut energy, virial) =
+            self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
+
+        energy += self_energy(q, self.alpha);
+
+        let phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
+
+        let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
+
+        (f, energy as f32, virial)
     }
 }
 
