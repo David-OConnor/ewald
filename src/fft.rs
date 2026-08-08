@@ -22,18 +22,41 @@ pub fn fft3d_r2c(
     dims: (usize, usize, usize),
     planner: &mut FftPlanner<f32>,
 ) -> Vec<Complex_> {
+    let mut real_planner = RealFftPlanner::new();
+    fft3d_r2c_with_planners(data_r, dims, planner, &mut real_planner)
+}
+
+/// Internal variant that reuses both complex and real FFT plans across PME steps.
+pub(crate) fn fft3d_r2c_with_planners(
+    data_r: &mut [f32],
+    dims: (usize, usize, usize),
+    planner: &mut FftPlanner<f32>,
+    real_planner: &mut RealFftPlanner<f32>,
+) -> Vec<Complex_> {
+    let mut out = Vec::new();
+    fft3d_r2c_into(data_r, dims, planner, real_planner, &mut out);
+    out
+}
+
+pub(crate) fn fft3d_r2c_into(
+    data_r: &mut [f32],
+    dims: (usize, usize, usize),
+    planner: &mut FftPlanner<f32>,
+    real_planner: &mut RealFftPlanner<f32>,
+    out: &mut Vec<Complex_>,
+) {
     let (nx, ny, nz) = dims;
 
     let nzc = nz / 2 + 1;
     let n_cplx = nx * ny * nzc;
 
-    let mut rplanner = RealFftPlanner::<f32>::new();
-    let r2c_z = rplanner.plan_fft_forward(nz);
+    let r2c_z = real_planner.plan_fft_forward(nz);
 
     let fft_y = planner.plan_fft_forward(ny);
     let fft_x = planner.plan_fft_forward(nx);
 
-    let mut out = vec![Complex_::new(0.0, 0.0); n_cplx];
+    out.resize(n_cplx, Complex_::new(0.0, 0.0));
+    let mut scratch_z = r2c_z.make_scratch_vec();
 
     // Z: R2C rows (contiguous)
     for ix in 0..nx {
@@ -42,19 +65,22 @@ pub fn fft3d_r2c(
             let row_k = ix * (ny * nzc) + iy * nzc;
             let in_row = &mut data_r[row_r..row_r + nz];
             let out_row = &mut out[row_k..row_k + nzc];
-            r2c_z.process(in_row, out_row).unwrap();
+            r2c_z
+                .process_with_scratch(in_row, out_row, &mut scratch_z)
+                .unwrap();
         }
     }
 
     // Y: C2C columns
     {
         let mut tmp = vec![Complex_::new(0.0, 0.0); ny];
+        let mut scratch = vec![Complex_::new(0.0, 0.0); fft_y.get_inplace_scratch_len()];
         for ix in 0..nx {
             for izc in 0..nzc {
                 for (j, iy) in (0..ny).enumerate() {
                     tmp[j] = out[ix * (ny * nzc) + iy * nzc + izc];
                 }
-                fft_y.process(&mut tmp);
+                fft_y.process_with_scratch(&mut tmp, &mut scratch);
                 for (j, iy) in (0..ny).enumerate() {
                     out[ix * (ny * nzc) + iy * nzc + izc] = tmp[j];
                 }
@@ -65,20 +91,19 @@ pub fn fft3d_r2c(
     // X: C2C columns (most strided)
     {
         let mut tmp = vec![Complex_::new(0.0, 0.0); nx];
+        let mut scratch = vec![Complex_::new(0.0, 0.0); fft_x.get_inplace_scratch_len()];
         for iy in 0..ny {
             for izc in 0..nzc {
                 for (k, ix) in (0..nx).enumerate() {
                     tmp[k] = out[ix * (ny * nzc) + iy * nzc + izc];
                 }
-                fft_x.process(&mut tmp);
+                fft_x.process_with_scratch(&mut tmp, &mut scratch);
                 for (k, ix) in (0..nx).enumerate() {
                     out[ix * (ny * nzc) + iy * nzc + izc] = tmp[k];
                 }
             }
         }
     }
-
-    out
 }
 
 /// Complex-to-real inverse 3D FFT.
@@ -90,11 +115,33 @@ pub fn fft3d_c2r(
     dims: (usize, usize, usize),
     planner: &mut FftPlanner<f32>,
 ) -> Vec<f32> {
+    let mut real_planner = RealFftPlanner::new();
+    fft3d_c2r_with_planners(data_k, dims, planner, &mut real_planner)
+}
+
+/// Internal variant that reuses both complex and real FFT plans across PME steps.
+pub(crate) fn fft3d_c2r_with_planners(
+    data_k: &mut [Complex_],
+    dims: (usize, usize, usize),
+    planner: &mut FftPlanner<f32>,
+    real_planner: &mut RealFftPlanner<f32>,
+) -> Vec<f32> {
+    let mut out = Vec::new();
+    fft3d_c2r_into(data_k, dims, planner, real_planner, &mut out);
+    out
+}
+
+pub(crate) fn fft3d_c2r_into(
+    data_k: &mut [Complex_],
+    dims: (usize, usize, usize),
+    planner: &mut FftPlanner<f32>,
+    real_planner: &mut RealFftPlanner<f32>,
+    out: &mut Vec<f32>,
+) {
     let (nx, ny, nz) = dims;
     let nzc = nz / 2 + 1;
 
-    let mut planner_real = RealFftPlanner::<f32>::new();
-    let c2r_z = planner_real.plan_fft_inverse(nz);
+    let c2r_z = real_planner.plan_fft_inverse(nz);
 
     let ifft_y = planner.plan_fft_inverse(ny);
     let ifft_x = planner.plan_fft_inverse(nx);
@@ -102,12 +149,13 @@ pub fn fft3d_c2r(
     // inverse X: C2C
     {
         let mut tmp = vec![Complex_::new(0.0, 0.0); nx];
+        let mut scratch = vec![Complex_::new(0.0, 0.0); ifft_x.get_inplace_scratch_len()];
         for iy in 0..ny {
             for izc in 0..nzc {
                 for (k, ix) in (0..nx).enumerate() {
                     tmp[k] = data_k[ix * (ny * nzc) + iy * nzc + izc];
                 }
-                ifft_x.process(&mut tmp);
+                ifft_x.process_with_scratch(&mut tmp, &mut scratch);
                 for (k, ix) in (0..nx).enumerate() {
                     data_k[ix * (ny * nzc) + iy * nzc + izc] = tmp[k];
                 }
@@ -118,13 +166,14 @@ pub fn fft3d_c2r(
     // inverse Y: C2C
     {
         let mut tmp = vec![Complex_::new(0.0, 0.0); ny];
+        let mut scratch = vec![Complex_::new(0.0, 0.0); ifft_y.get_inplace_scratch_len()];
 
         for ix in 0..nx {
             for izc in 0..nzc {
                 for (j, iy) in (0..ny).enumerate() {
                     tmp[j] = data_k[ix * (ny * nzc) + iy * nzc + izc];
                 }
-                ifft_y.process(&mut tmp);
+                ifft_y.process_with_scratch(&mut tmp, &mut scratch);
                 for (j, iy) in (0..ny).enumerate() {
                     data_k[ix * (ny * nzc) + iy * nzc + izc] = tmp[j];
                 }
@@ -133,7 +182,8 @@ pub fn fft3d_c2r(
     }
 
     // Z: C2R rows (contiguous)
-    let mut out = vec![0.; nx * ny * nz];
+    out.resize(nx * ny * nz, 0.0);
+    let mut scratch_z = c2r_z.make_scratch_vec();
     for ix in 0..nx {
         for iy in 0..ny {
             let row_k = ix * (ny * nzc) + iy * nzc;
@@ -147,11 +197,11 @@ pub fn fft3d_c2r(
                 in_row[nzc - 1].im = 0.0;
             }
 
-            c2r_z.process(in_row, out_row).unwrap();
+            c2r_z
+                .process_with_scratch(in_row, out_row, &mut scratch_z)
+                .unwrap();
         }
     }
-
-    out
 }
 
 // // todo: Experimenting
@@ -197,15 +247,7 @@ unsafe extern "C" {
     /// A forward real-to-complex FFT, using cuFFT or vkFFT.
     pub(crate) fn exec_forward(plan: *mut c_void, rho_real: *mut c_void, rho: *mut c_void);
 
-    pub(crate) fn exec_inverse(
-        plan: *mut c_void,
-        exk: *mut c_void,
-        eyk: *mut c_void,
-        ezk: *mut c_void,
-        ex: *mut c_void,
-        ey: *mut c_void,
-        ez: *mut c_void,
-    );
+    pub(crate) fn exec_inverse(plan: *mut c_void, ek: *mut c_void, e: *mut c_void);
 }
 
 #[cfg(feature = "cuda")]

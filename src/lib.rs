@@ -29,6 +29,7 @@ mod gpu_shared;
 pub mod short_range;
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
+use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 pub use short_range::*;
 use statrs::function::erf::erf;
@@ -50,6 +51,14 @@ const TWO_INV_SQRT_PI: f32 = 2. / SQRT_PI;
 const SPLINE_ORDER: usize = 4;
 
 type Complex_ = Complex<f32>;
+
+#[derive(Default)]
+struct CpuWorkspace {
+    rho_real: Vec<f32>,
+    rho: Vec<Complex_>,
+    phi_k: Vec<Complex_>,
+    phi_real: Vec<f32>,
+}
 
 /// Initialize this once for the application, or once per step.
 /// Note:
@@ -73,6 +82,8 @@ pub struct PmeRecip {
     bmod_sq_inv_z: Vec<f32>,
     /// For CPU FFTs
     planner: FftPlanner<f32>,
+    real_planner: RealFftPlanner<f32>,
+    cpu_workspace: CpuWorkspace,
     /// For GPU FFTs. None if compiling with GPU support, but there is a runtime problem,
     /// e.g. no CUDA on the system running it.
     #[cfg(feature = "cuda")]
@@ -112,14 +123,10 @@ impl PmeRecip {
                         let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
                         // let kernel_ghat = module.load_function("apply_ghat_and_compute_potential").unwrap();
                         let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
-                        let kernel_half_spectrum =
-                            module.load_function("energy_half_spectrum").unwrap();
-
                         Kernels {
                             kernel_spread,
                             kernel_ghat,
                             kernel_gather,
-                            kernel_half_spectrum,
                         }
                     };
 
@@ -134,11 +141,13 @@ impl PmeRecip {
 
                     #[cfg(feature = "cuda")]
                     let planner_gpu = fft::create_gpu_plan(plan_dims, s);
+                    let workspace = gpu_shared::GpuWorkspace::new(plan_dims, s);
 
                     Some(GpuData {
                         planner_gpu,
                         gpu_tables,
                         kernels,
+                        workspace,
                     })
                 }
                 Err(_) => None,
@@ -160,6 +169,8 @@ impl PmeRecip {
             bmod_sq_inv_y,
             bmod_sq_inv_z,
             planner: FftPlanner::new(),
+            real_planner: RealFftPlanner::new(),
+            cpu_workspace: CpuWorkspace::default(),
             #[cfg(feature = "cuda")]
             gpu_data,
         }
@@ -170,13 +181,14 @@ impl PmeRecip {
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
         let (nx, ny, nz) = self.plan_dims;
         let (lx, ly, lz) = self.box_dims;
+        let (grid_x, grid_y, grid_z) = (nx as f32 / lx, ny as f32 / ly, nz as f32 / lz);
 
         let nynz = ny * nz; // Z-fast layout helper
 
         for (r, &qi) in pos.iter().zip(q.iter()) {
-            let sx = r.x / lx * nx as f32;
-            let sy = r.y / ly * ny as f32;
-            let sz = r.z / lz * nz as f32;
+            let sx = r.x * grid_x;
+            let sy = r.y * grid_y;
+            let sz = r.z * grid_z;
 
             let (ix0, wx) = bspline4_weights(sx);
             let (iy0, wy) = bspline4_weights(sy);
@@ -215,24 +227,47 @@ impl PmeRecip {
         let nzc = nz / 2 + 1;
         let n_k = nx * ny * nzc;
 
-        // Charge density.
-        let mut rho_real = vec![0.; n_real];
-        self.spread_charges(posits, q, &mut rho_real);
+        let mut workspace = std::mem::take(&mut self.cpu_workspace);
+
+        // Charge density. Reuse all mesh-sized buffers across PME steps.
+        workspace.rho_real.resize(n_real, 0.0);
+        workspace.rho_real.fill(0.0);
+        self.spread_charges(posits, q, &mut workspace.rho_real);
 
         // Convert spread charges to K space
-        let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
+        fft::fft3d_r2c_into(
+            &mut workspace.rho_real,
+            self.plan_dims,
+            &mut self.planner,
+            &mut self.real_planner,
+            &mut workspace.rho,
+        );
 
-        let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
-        let (mut energy, _virial) = self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
+        workspace.phi_k.resize(n_k, Complex::new(0.0, 0.0));
+        let (mut energy, _virial) =
+            self.apply_ghat_and_compute_potential(&workspace.rho, &mut workspace.phi_k, ny, nzc);
 
         energy += self_energy(q, self.alpha);
 
         // Inverse FFT (Complex -> Real) to get Scalar Potential Grid.
         // No /N normalization: ghat encodes 1/V so IFFT(ghat * rho_k) gives
         // the physical potential directly (unnormalized IFFT convention).
-        let phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
+        fft::fft3d_c2r_into(
+            &mut workspace.phi_k,
+            self.plan_dims,
+            &mut self.planner,
+            &mut self.real_planner,
+            &mut workspace.phi_real,
+        );
 
-        let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
+        let f = gather_forces_from_potential(
+            posits,
+            q,
+            &workspace.phi_real,
+            self.plan_dims,
+            self.box_dims,
+        );
+        self.cpu_workspace = workspace;
 
         (f, energy as f32)
     }
@@ -321,20 +356,41 @@ impl PmeRecip {
         let nzc = nz / 2 + 1;
         let n_k = nx * ny * nzc;
 
-        let mut rho_real = vec![0.; n_real];
-        self.spread_charges(posits, q, &mut rho_real);
+        let mut workspace = std::mem::take(&mut self.cpu_workspace);
+        workspace.rho_real.resize(n_real, 0.0);
+        workspace.rho_real.fill(0.0);
+        self.spread_charges(posits, q, &mut workspace.rho_real);
 
-        let rho = fft3d_r2c(&mut rho_real, self.plan_dims, &mut self.planner);
+        fft::fft3d_r2c_into(
+            &mut workspace.rho_real,
+            self.plan_dims,
+            &mut self.planner,
+            &mut self.real_planner,
+            &mut workspace.rho,
+        );
 
-        let mut phi_k = vec![Complex::new(0.0, 0.0); n_k];
+        workspace.phi_k.resize(n_k, Complex::new(0.0, 0.0));
         let (mut energy, virial) =
-            self.apply_ghat_and_compute_potential(&rho, &mut phi_k, ny, nzc);
+            self.apply_ghat_and_compute_potential(&workspace.rho, &mut workspace.phi_k, ny, nzc);
 
         energy += self_energy(q, self.alpha);
 
-        let phi_real = fft3d_c2r(&mut phi_k, self.plan_dims, &mut self.planner);
+        fft::fft3d_c2r_into(
+            &mut workspace.phi_k,
+            self.plan_dims,
+            &mut self.planner,
+            &mut self.real_planner,
+            &mut workspace.phi_real,
+        );
 
-        let f = gather_forces_from_potential(posits, q, &phi_real, self.plan_dims, self.box_dims);
+        let f = gather_forces_from_potential(
+            posits,
+            q,
+            &workspace.phi_real,
+            self.plan_dims,
+            self.box_dims,
+        );
+        self.cpu_workspace = workspace;
 
         (f, energy as f32, virial)
     }
@@ -448,12 +504,15 @@ fn bspline4_weights_and_derivs(s: f32) -> (isize, [f32; 4], [f32; 4]) {
 }
 
 fn wrap(i: isize, n: usize) -> usize {
-    let n_isize = n as isize;
-    let mut v = i % n_isize;
-    if v < 0 {
-        v += n_isize;
+    // Callers supply primary-box positions, so the four-point spline support
+    // can cross a boundary by at most one grid width.
+    if i < 0 {
+        (i + n as isize) as usize
+    } else if i >= n as isize {
+        (i - n as isize) as usize
+    } else {
+        i as usize
     }
-    v as usize
 }
 
 /// For flexible molecules, computes the correction term.
@@ -604,6 +663,38 @@ mod tests {
                     "bmod2[{k}] = {val} is not finite/positive (n={n})"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_gpu_reciprocal_matches_cpu_energy_and_force_direction() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let dims = (24, 24, 24);
+        let box_dims = (24.0, 24.0, 24.0);
+        let mut pme = PmeRecip::new(Some(&stream), dims, box_dims, 0.265);
+        let pos = [
+            Vec3::new(6.2, 8.1, 9.4),
+            Vec3::new(11.7, 13.3, 15.8),
+            Vec3::new(17.1, 5.6, 12.2),
+            Vec3::new(8.9, 18.4, 4.7),
+        ];
+        let q = [1.0, -0.8, 0.35, -0.55];
+
+        let (cpu_forces, cpu_energy) = pme.forces(&pos, &q);
+        let (gpu_forces, gpu_energy) = pme.forces_gpu(&stream, &pos, &q);
+        let (gpu_forces_repeat, gpu_energy_repeat) = pme.forces_gpu(&stream, &pos, &q);
+
+        let energy_scale = cpu_energy.abs().max(1.0);
+        assert!((gpu_energy - cpu_energy).abs() / energy_scale < 2e-4);
+        assert!((gpu_energy_repeat - gpu_energy).abs() / energy_scale < 2e-5);
+        for ((cpu, gpu), repeat) in cpu_forces.iter().zip(&gpu_forces).zip(&gpu_forces_repeat) {
+            assert!(gpu.x.is_finite() && gpu.y.is_finite() && gpu.z.is_finite());
+            // CPU uses spline-derivative interpolation while GPU uses spectral
+            // differentiation, so compare direction rather than bitwise values.
+            assert!(cpu.dot(*gpu) > 0.0, "CPU {cpu:?}, GPU {gpu:?}");
+            assert!((*gpu - *repeat).magnitude() < 1e-5);
         }
     }
 }

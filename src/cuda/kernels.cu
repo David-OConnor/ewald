@@ -10,7 +10,11 @@ const int32_t SPLINE_ORDER = 4;
 
 __device__ __forceinline__
 int wrap(int32_t a, int32_t n) {
-    a %= n; return (a < 0) ? a + n : a;
+    // PME positions are in the primary box and cubic splines reach at most one
+    // cell past either edge, so avoid integer remainder in the innermost loops.
+    if (a < 0) return a + n;
+    if (a >= n) return a - n;
+    return a;
 }
 
 
@@ -48,9 +52,9 @@ void spread_charges(
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float lx,
-    float ly,
-    float lz
+    float grid_x,
+    float grid_y,
+    float grid_z
 ) {
     size_t i0 = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
@@ -60,9 +64,9 @@ void spread_charges(
     for (size_t i = i0; i < (size_t)n_atoms; i += stride) {
         float3 r = pos[i];
 
-        float sx = r.x / lx * nx;
-        float sy = r.y / ly * ny;
-        float sz = r.z / lz * nz;
+        float sx = r.x * grid_x;
+        float sy = r.y * grid_y;
+        float sz = r.z * grid_z;
 
         int32_t ix0, iy0, iz0;
         float wx[SPLINE_ORDER], wy[SPLINE_ORDER], wz[SPLINE_ORDER];
@@ -100,9 +104,7 @@ void spread_charges(
 extern "C" __global__
 void apply_ghat_and_grad(
     const float2* rho,
-    float2* exk,
-    float2* eyk,
-    float2* ezk,
+    float2* ek,
     //
     const float* kx,
     const float* ky,
@@ -116,50 +118,70 @@ void apply_ghat_and_grad(
     int32_t nz,
     float vol,
     float alpha,
-    int32_t n_real
+    double* energy_partial
  ) {
     int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int32_t nzc = nz/2 + 1;
     int32_t n_cmplx = nx * ny * nzc;
-    if (idx >= n_cmplx) return;
+    float2* exk = ek;
+    float2* eyk = ek + n_cmplx;
+    float2* ezk = ek + 2 * n_cmplx;
+    double energy = 0.0;
 
-    // Z-fast decoding
-    int32_t iz = idx % nzc;                 // 0 .. nz/2
-    int32_t iy = (idx / nzc) % ny;          // 0 .. ny-1
-    int32_t ix =  idx / (nzc * ny);         // 0 .. nx-1
+    // Every thread must reach the block reduction below, including padding threads.
+    if (idx < n_cmplx) {
+        // Z-fast decoding
+        int32_t iz = idx % nzc;                 // 0 .. nz/2
+        int32_t iy = (idx / nzc) % ny;          // 0 .. ny-1
+        int32_t ix =  idx / (nzc * ny);         // 0 .. nx-1
 
-    float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
+        float kxv = kx[ix], kyv = ky[iy], kzv = kz[iz];
+        float k2  = fmaf(kxv, kxv, fmaf(kyv, kyv, kzv*kzv));
+        float bmod2 = bx[ix] * by[iy] * bz[iz];
 
-    float k2  = fmaf(kxv, kxv, fmaf(kyv, kyv, kzv*kzv));
-    if (k2 == 0.f) { exk[idx].x=exk[idx].y=0.f; eyk[idx]=exk[idx]; ezk[idx]=exk[idx]; return; }
+        if (k2 == 0.f || bmod2 <= 1e-10f) {
+            exk[idx] = make_float2(0.f, 0.f);
+            eyk[idx] = make_float2(0.f, 0.f);
+            ezk[idx] = make_float2(0.f, 0.f);
+        } else {
+            const float TWO_TAU = 12.56637061435917295385f; // 4π
 
-    float bmod2 = bx[ix] * by[iy] * bz[iz];
-    if (bmod2 <= 1e-10f) { exk[idx].x=exk[idx].y=0.f; eyk[idx]=exk[idx]; ezk[idx]=exk[idx]; return; }
+            // bmod2 = bx*by*bz = 1/|B|² (the B-spline deconvolution factor stored as inverse).
+            float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) * bmod2 / k2;
+            float2 rho_v = rho[idx];
+            float phi_k_real = rho_v.x * ghat;
+            float phi_k_im   = rho_v.y * ghat;
 
-    const float TWO_TAU = 12.56637061435917295385f; // 4π
+            exk[idx] = make_float2(-kxv * phi_k_im, kxv * phi_k_real);
+            eyk[idx] = make_float2(-kyv * phi_k_im, kyv * phi_k_real);
+            ezk[idx] = make_float2(-kzv * phi_k_im, kzv * phi_k_real);
 
-    // bmod2 = bx*by*bz = 1/|B|² (the B-spline deconvolution factor stored as inverse).
-    // So ghat must MULTIPLY by bmod2 (= 1/|B|²), not divide.
-    // Dividing by bmod2 would be multiplying by |B|², which is the inverse of the correct factor.
-    float ghat = (TWO_TAU / vol) * __expf(-k2 / (4.0f * alpha * alpha)) * bmod2 / k2;
+            // Interior z modes represent both members of a conjugate pair.
+            double weight = (iz > 0 && iz < nzc - 1) ? 2.0 : 1.0;
+            energy = weight * 0.5 *
+                ((double)rho_v.x * (double)phi_k_real +
+                 (double)rho_v.y * (double)phi_k_im);
+        }
+    }
 
-    // φ(k) = G(k) * ρ(k)
-    float phi_k_real = rho[idx].x * ghat;
-    float phi_k_im   = rho[idx].y * ghat;
-
-    // E(k) = i * k * φ(k)
-    // ex = (-kx * Im φ,  kx * Re φ)
-    // ey = (-ky * Im φ,  ky * Re φ)
-    // ez = (-kz * Im φ,  kz * Re φ)
-    exk[idx].x = -kxv * phi_k_im;
-    exk[idx].y =  kxv * phi_k_real;
-
-    eyk[idx].x = -kyv * phi_k_im;
-    eyk[idx].y =  kyv * phi_k_real;
-
-    ezk[idx].x = -kzv * phi_k_im;
-    ezk[idx].y =  kzv * phi_k_real;
+    // Reduce energy while G(k) and rho are already resident; this avoids a second
+    // full-grid kernel that used to recompute exp(), k², and the deconvolution.
+    __shared__ double warp_sums[32];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        energy += __shfl_down_sync(0xffffffff, energy, offset);
+    }
+    if (lane == 0) warp_sums[warp] = energy;
+    __syncthreads();
+    energy = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            energy += __shfl_down_sync(0xffffffff, energy, offset);
+        }
+        if (lane == 0) energy_partial[blockIdx.x] = energy;
+    }
 
 
     // No rim handling needed: phi(k) is Hermitian because rho_k comes from FFT of real data
@@ -248,26 +270,29 @@ void apply_ghat_and_compute_potential(
 extern "C" __global__
 void gather_forces_to_atoms(
     const float3* pos,
-    const float*  ex,
-    const float*  ey,
-    const float*  ez,
+    const float*  e,
     const float*  q,
     float3*       out_f,
     int32_t n_atoms,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float lx,
-    float ly,
-    float lz
+    float grid_x,
+    float grid_y,
+    float grid_z
 ) {
     int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_atoms) return;
 
+    const size_t n_real = (size_t)nx * (size_t)ny * (size_t)nz;
+    const float* ex = e;
+    const float* ey = e + n_real;
+    const float* ez = e + 2 * n_real;
+
     float3 r = pos[i];
-    float sx = r.x / lx * nx;
-    float sy = r.y / ly * ny;
-    float sz = r.z / lz * nz;
+    float sx = r.x * grid_x;
+    float sy = r.y * grid_y;
+    float sz = r.z * grid_z;
 
     int32_t ix0 = __float2int_rd(sx) - 1;
     int32_t iy0 = __float2int_rd(sy) - 1;

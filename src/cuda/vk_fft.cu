@@ -57,22 +57,14 @@ void* make_plan(int32_t nx, int32_t ny, int32_t nz, void* stream) {
     cfg->size[1] = (uint64_t)ny;
     cfg->size[2] = (uint64_t)nx;
 
-    cfg->isInputFormatted  = 1;
-    cfg->isOutputFormatted = 1;
-
-//     cfg->inputBufferStride[0] = cfg->size[0];
-//     cfg->inputBufferStride[1] = cfg->inputBufferStride[0] * cfg->size[1];
-//     cfg->inputBufferStride[2] = cfg->inputBufferStride[1] * cfg->size[2];
-
-    cfg->inputBufferStride[0] = 1;                          // z step
-    cfg->inputBufferStride[1] = cfg->size[0];               // y step = nz
-    cfg->inputBufferStride[2] = cfg->size[0] * cfg->size[1]; // x step = nz*ny
-
-    cfg->bufferStride[0] = (uint64_t)(cfg->size[0] / 2) + 1;
-    cfg->bufferStride[1] = cfg->bufferStride[0] * cfg->size[1];
-    cfg->bufferStride[2] = cfg->bufferStride[1] * cfg->size[2];
+    cfg->isInputFormatted = 1;
+    // VkFFT stride entries are cumulative row/plane sizes, not per-axis steps.
+    cfg->inputBufferStride[0] = cfg->size[0];
+    cfg->inputBufferStride[1] = cfg->size[0] * cfg->size[1];
+    cfg->inputBufferStride[2] = cfg->size[0] * cfg->size[1] * cfg->size[2];
 
     cfg->performR2C = 1;
+    cfg->inverseReturnToInputBuffer = 1;
     cfg->normalize = 0;
     cfg->numberBatches = 1;
 
@@ -104,23 +96,28 @@ void exec_forward(void* plan_, void* real_in, void* complex_out) {
     VkFFTLaunchParams lp;
     memset(&lp, 0, sizeof(lp));
 
-    lp.buffer = (void**)&in;
-    lp.outputBuffer = (void**)&out;
+    lp.inputBuffer = (void**)&in;
+    lp.buffer = (void**)&out;
 
     VkFFTResult res = VkFFTAppend(&plan->app, -1, &lp);
 }
 
 void exec_inverse(void* plan_, void* complex_in, void* real_out) {
     VkFftPlan* plan = (VkFftPlan*)plan_;
+    const uint64_t complex_stride = plan->Nx * plan->Ny * (plan->Nz / 2 + 1) * sizeof(float) * 2;
+    const uint64_t real_stride = plan->Nx * plan->Ny * plan->Nz * sizeof(float);
 
-    CUdeviceptr in = (CUdeviceptr)complex_in;
-    CUdeviceptr out = (CUdeviceptr)real_out;
+    // VkFFT uses the same contiguous [Ex | Ey | Ez] workspace as cuFFT. This
+    // plan is single-batch, so append the three transforms with pointer offsets.
+    for (uint64_t batch = 0; batch < 3; ++batch) {
+        CUdeviceptr in = (CUdeviceptr)complex_in + batch * complex_stride;
+        CUdeviceptr out = (CUdeviceptr)real_out + batch * real_stride;
 
-    VkFFTLaunchParams lp;
-    memset(&lp, 0, sizeof(lp));
-
-    lp.buffer = (void**)&in;
-    lp.outputBuffer = (void**)&out;
-
-    VkFFTResult res = VkFFTAppend(&plan->app, 1, &lp);
+        VkFFTLaunchParams lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.inputBuffer = (void**)&out;
+        lp.buffer = (void**)&in;
+        VkFFTResult res = VkFFTAppend(&plan->app, 1, &lp);
+        (void)res;
+    }
 }

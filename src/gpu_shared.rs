@@ -1,16 +1,78 @@
 //! Used by both vkFFT and cuFFT pipelines. Computetes long-range reciprical forces on the GPU,
 //! using a mix of our kernels, and host-FFI-initiated FFTs.
 
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, mem::size_of, sync::Arc};
 
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
-use lin_alg::f32::{Vec3, vec3s_to_dev};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, HostSlice, LaunchConfig,
+    PushKernelArg, SyncOnDrop, result,
+};
+use lin_alg::f32::Vec3;
 
 use crate::{
     PmeRecip,
     fft::{destroy_plan, exec_forward, exec_inverse},
     self_energy,
 };
+
+/// Reusable page-locked host storage with normal CPU cacheability. cudarc's
+/// built-in pinned allocation is write-combined, which is unsuitable for the
+/// force and energy buffers read back by the CPU.
+struct PinnedBuffer<T: DeviceRepr> {
+    ptr: *mut T,
+    len: usize,
+    stream: Arc<CudaStream>,
+}
+
+unsafe impl<T: DeviceRepr> Send for PinnedBuffer<T> {}
+unsafe impl<T: DeviceRepr> Sync for PinnedBuffer<T> {}
+
+impl<T: DeviceRepr> PinnedBuffer<T> {
+    fn new(stream: &Arc<CudaStream>, len: usize) -> Self {
+        let ptr = unsafe { result::malloc_host(len * size_of::<T>(), 0).unwrap() } as *mut T;
+        assert!(!ptr.is_null());
+        Self {
+            ptr,
+            len,
+            stream: stream.clone(),
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T: DeviceRepr> Drop for PinnedBuffer<T> {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+        let _ = unsafe { result::free_host(self.ptr.cast()) };
+    }
+}
+
+impl<T: DeviceRepr> HostSlice<T> for PinnedBuffer<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    unsafe fn stream_synced_slice<'a>(
+        &'a self,
+        _stream: &'a CudaStream,
+    ) -> (&'a [T], SyncOnDrop<'a>) {
+        (self.as_slice(), SyncOnDrop::Sync(None))
+    }
+
+    unsafe fn stream_synced_mut_slice<'a>(
+        &'a mut self,
+        _stream: &'a CudaStream,
+    ) -> (&'a mut [T], SyncOnDrop<'a>) {
+        (self.as_mut_slice(), SyncOnDrop::Sync(None))
+    }
+}
 
 /// Group GPU-specific state, so they can be made an option as a whole, in the case
 /// of compiling with GPU support, but no stream is available.
@@ -19,6 +81,7 @@ pub(crate) struct GpuData {
     pub planner_gpu: *mut c_void,
     pub gpu_tables: GpuTables,
     pub kernels: Kernels,
+    pub workspace: GpuWorkspace,
     // #[cfg(feature = "vkfft")]
     // pub vk_ctx: Arc<vk_fft::VkContext>,
 }
@@ -27,7 +90,67 @@ pub(crate) struct Kernels {
     pub kernel_spread: CudaFunction,
     pub kernel_ghat: CudaFunction,
     pub kernel_gather: CudaFunction,
-    pub kernel_half_spectrum: CudaFunction,
+}
+
+/// Mesh-sized buffers persist for the lifetime of the PME plan. Atom-sized
+/// buffers are replaced only when the number of particles changes.
+pub(crate) struct GpuWorkspace {
+    rho_real: CudaSlice<f32>,
+    rho: CudaSlice<f32>,
+    ek: CudaSlice<f32>,
+    e: CudaSlice<f32>,
+    energy_partial: CudaSlice<f64>,
+    energy_host: PinnedBuffer<f64>,
+    atoms: Option<GpuAtomWorkspace>,
+}
+
+struct GpuAtomWorkspace {
+    len: usize,
+    pos_dev: CudaSlice<f32>,
+    q_dev: CudaSlice<f32>,
+    force_dev: CudaSlice<f32>,
+    pos_host: PinnedBuffer<f32>,
+    q_host: PinnedBuffer<f32>,
+    force_host: PinnedBuffer<f32>,
+}
+
+impl GpuWorkspace {
+    pub(crate) fn new(plan_dims: (usize, usize, usize), stream: &Arc<CudaStream>) -> Self {
+        let (nx, ny, nz) = plan_dims;
+        let n_real = nx * ny * nz;
+        let n_cplx = nx * ny * (nz / 2 + 1);
+        let energy_blocks = n_cplx.div_ceil(256);
+
+        Self {
+            rho_real: stream.alloc_zeros(n_real).unwrap(),
+            rho: stream.alloc_zeros(2 * n_cplx).unwrap(),
+            ek: stream.alloc_zeros(3 * 2 * n_cplx).unwrap(),
+            e: stream.alloc_zeros(3 * n_real).unwrap(),
+            energy_partial: stream.alloc_zeros(energy_blocks).unwrap(),
+            energy_host: PinnedBuffer::new(stream, energy_blocks),
+            atoms: None,
+        }
+    }
+
+    fn ensure_atoms(&mut self, n_atoms: usize, stream: &Arc<CudaStream>) {
+        if self
+            .atoms
+            .as_ref()
+            .is_some_and(|atoms| atoms.len == n_atoms)
+        {
+            return;
+        }
+
+        self.atoms = Some(GpuAtomWorkspace {
+            len: n_atoms,
+            pos_dev: stream.alloc_zeros(3 * n_atoms).unwrap(),
+            q_dev: stream.alloc_zeros(n_atoms).unwrap(),
+            force_dev: stream.alloc_zeros(3 * n_atoms).unwrap(),
+            pos_host: PinnedBuffer::new(stream, 3 * n_atoms),
+            q_host: PinnedBuffer::new(stream, n_atoms),
+            force_host: PinnedBuffer::new(stream, 3 * n_atoms),
+        });
+    }
 }
 
 pub(crate) struct GpuTables {
@@ -71,37 +194,46 @@ impl PmeRecip {
         };
 
         assert_eq!(posits.len(), q.len());
+        if posits.is_empty() {
+            return (Vec::new(), 0.0);
+        }
 
-        let (nx, ny, nz) = self.plan_dims;
+        data.workspace.ensure_atoms(posits.len(), stream);
+        let GpuWorkspace {
+            rho_real,
+            rho,
+            ek,
+            e,
+            energy_partial,
+            energy_host,
+            atoms,
+        } = &mut data.workspace;
+        let atoms = atoms.as_mut().unwrap();
 
-        let n_real = nx * ny * nz;
-        let nzc = nz / 2 + 1;
-        let n_cplx = nx * ny * nzc;
+        // Pinned staging buffers make these copies genuinely asynchronous. Ordinary
+        // Vec-backed copies force cudarc to synchronize the stream after each copy.
+        {
+            let pos_host = atoms.pos_host.as_mut_slice();
+            for (dst, posit) in pos_host.chunks_exact_mut(3).zip(posits) {
+                dst.copy_from_slice(&posit.to_arr());
+            }
+            atoms.q_host.as_mut_slice().copy_from_slice(q);
+        }
+        stream
+            .memcpy_htod(&atoms.pos_host, &mut atoms.pos_dev)
+            .unwrap();
+        stream.memcpy_htod(&atoms.q_host, &mut atoms.q_dev).unwrap();
 
-        let complex_len = n_cplx * 2; // (re,im) interleaved
-
-        // ---------- Allocate arrays on the GPU
-
-        // todo: Should we init these once and store, instead of re-allocating at each step?
-        // Set up positions, rho, and charge on the GPU once; they'll be used a few times in this function.
-        let pos_dev = vec3s_to_dev(stream, posits);
-        let q_dev = stream.clone_htod(q).unwrap();
-
-        // let mut rho_real_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        // let mut rho_cplx_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-
-        // GPU buffers of complex numbers are flattened.
-
-        // Charge density.
-        let mut rho_real_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let mut rho_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
+        // Only the charge grid needs clearing; every other workspace buffer is
+        // completely overwritten by its producing kernel or FFT.
+        stream.memset_zeros(rho_real).unwrap();
 
         spread_charges(
             stream,
             &data.kernels.kernel_spread,
-            &pos_dev,
-            &q_dev,
-            &mut rho_real_dev,
+            &atoms.pos_dev,
+            &atoms.q_dev,
+            rho_real,
             posits.len() as u32,
             self.plan_dims,
             self.box_dims,
@@ -120,8 +252,8 @@ impl PmeRecip {
         unsafe {
             exec_forward(
                 data.planner_gpu,
-                cuda_slice_to_ptr_mut(&rho_real_dev, stream),
-                cuda_slice_to_ptr_mut(&rho_dev, stream),
+                cuda_slice_to_ptr_mut(rho_real, stream),
+                cuda_slice_to_ptr_mut(rho, stream),
             );
 
             // #[cfg(feature = "cufft")]
@@ -141,26 +273,13 @@ impl PmeRecip {
         //     }
         // }
 
-        // todo: Pre-allocate these instead of every step?
-        // Contiguous complex buffer: [exk | eyk | ezk]
-        // let ekx_eky_ekz_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * complex_len).unwrap();
-        let mut exk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let mut eyk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-        let mut ezk_dev: CudaSlice<f32> = stream.alloc_zeros(complex_len).unwrap();
-
-        // k-space pointers for FFT FFI)
-        let ekx_ptr = cuda_slice_to_ptr_mut(&exk_dev, stream);
-        let eky_ptr = cuda_slice_to_ptr_mut(&eyk_dev, stream);
-        let ekz_ptr = cuda_slice_to_ptr_mut(&ezk_dev, stream);
-
-        // Apply G(k) and gradient to get Exk/Eyk/Ezk
+        // Apply G(k), compute gradients, and reduce reciprocal energy in one pass.
         apply_ghat_and_grad(
             stream,
             &data.kernels.kernel_ghat,
-            &rho_dev,
-            &mut exk_dev,
-            &mut eyk_dev,
-            &mut ezk_dev,
+            rho,
+            ek,
+            energy_partial,
             &data.gpu_tables,
             self.plan_dims,
             self.vol,
@@ -187,47 +306,11 @@ impl PmeRecip {
         //     // }
         // }
 
-        let mut out_partial_gpu: CudaSlice<f64> = stream.alloc_zeros(n_cplx).unwrap();
-
-        energy_half_spectrum(
-            stream,
-            &data.kernels.kernel_half_spectrum,
-            &mut rho_dev,
-            &mut out_partial_gpu,
-            &data.gpu_tables,
-            self.plan_dims,
-            self.vol,
-            self.alpha,
-        );
-
-        let energy: f64 = stream
-            .clone_dtoh(&out_partial_gpu)
-            // .memcpy_dtov(&out_partial_gpu)
-            .unwrap()
-            .into_iter()
-            .sum();
-
-        let energy = (energy + self_energy(q, self.alpha)) as f32;
-
-        // println!("\n Energy GPU: {:?}", energy);
-
-        let ex_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let ey_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-        let ez_dev: CudaSlice<f32> = stream.alloc_zeros(n_real).unwrap();
-
-        let ex_ptr = cuda_slice_to_ptr_mut(&ex_dev, stream);
-        let ey_ptr = cuda_slice_to_ptr_mut(&ey_dev, stream);
-        let ez_ptr = cuda_slice_to_ptr_mut(&ez_dev, stream);
-
         unsafe {
             exec_inverse(
                 data.planner_gpu,
-                ekx_ptr,
-                eky_ptr,
-                ekz_ptr,
-                ex_ptr,
-                ey_ptr,
-                ez_ptr,
+                cuda_slice_to_ptr_mut(ek, stream),
+                cuda_slice_to_ptr_mut(e, stream),
             );
 
             // todo: QC this
@@ -263,28 +346,31 @@ impl PmeRecip {
         //     }
         // }
 
-        let n_atoms = posits.len();
-        let mut out_f_gpu: CudaSlice<f32> = stream.alloc_zeros(3 * n_atoms).unwrap();
-
         gather_forces_to_atoms(
             stream,
             &data.kernels.kernel_gather,
-            &pos_dev,
-            &q_dev,
-            &ex_dev,
-            &ey_dev,
-            &ez_dev,
-            &mut out_f_gpu,
+            &atoms.pos_dev,
+            &atoms.q_dev,
+            e,
+            &mut atoms.force_dev,
             self.plan_dims,
             self.box_dims,
         );
 
-        // D2H forces
-        let f_host: Vec<f32> = stream.clone_dtoh(&out_f_gpu).unwrap();
+        // Queue both D2H copies before synchronizing once when the pinned force
+        // buffer is read on the host.
+        stream.memcpy_dtoh(energy_partial, energy_host).unwrap();
+        stream
+            .memcpy_dtoh(&atoms.force_dev, &mut atoms.force_host)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let f_host = atoms.force_host.as_slice();
+        let reciprocal_energy: f64 = energy_host.as_slice().iter().sum();
+        let energy = (reciprocal_energy + self_energy(q, self.alpha)) as f32;
 
         // todo: QC the - sign?
-        let mut f = Vec::with_capacity(posits.len());
-        for i in 0..posits.len() {
+        let mut f = Vec::with_capacity(atoms.len);
+        for i in 0..atoms.len {
             f.push(-Vec3 {
                 x: f_host[i * 3 + 0],
                 y: f_host[i * 3 + 1],
@@ -342,6 +428,9 @@ fn spread_charges(
     let nz_i = nz as i32;
 
     let (lx, ly, lz) = box_dims;
+    let grid_x = nx as f32 / lx;
+    let grid_y = ny as f32 / ly;
+    let grid_z = nz as f32 / lz;
 
     let n_atoms_i = n_posits as i32;
 
@@ -358,9 +447,9 @@ fn spread_charges(
     launch_args.arg(&nx_i);
     launch_args.arg(&ny_i);
     launch_args.arg(&nz_i);
-    launch_args.arg(&lx);
-    launch_args.arg(&ly);
-    launch_args.arg(&lz);
+    launch_args.arg(&grid_x);
+    launch_args.arg(&grid_y);
+    launch_args.arg(&grid_z);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
@@ -370,9 +459,8 @@ fn apply_ghat_and_grad(
     stream: &Arc<CudaStream>,
     kernel: &CudaFunction,
     rho_dev: &CudaSlice<f32>, // Cplx
-    ekx_dev: &mut CudaSlice<f32>,
-    eky_dev: &mut CudaSlice<f32>,
-    ekz_dev: &mut CudaSlice<f32>,
+    ek_dev: &mut CudaSlice<f32>,
+    energy_partial: &mut CudaSlice<f64>,
     tables: &GpuTables,
     plan_dims: (usize, usize, usize),
     vol: f32,
@@ -384,16 +472,12 @@ fn apply_ghat_and_grad(
     let nz_i = nz as i32;
 
     let n = nx * ny * (nz / 2 + 1);
-    let n_real = (nx * ny * nz) as i32;
-
     let cfg = launch_cfg(n as u32, 256);
     let mut launch_args = stream.launch_builder(kernel);
 
     launch_args.arg(rho_dev);
 
-    launch_args.arg(ekx_dev);
-    launch_args.arg(eky_dev);
-    launch_args.arg(ekz_dev);
+    launch_args.arg(ek_dev);
 
     launch_args.arg(&tables.kx);
     launch_args.arg(&tables.ky);
@@ -409,55 +493,7 @@ fn apply_ghat_and_grad(
     launch_args.arg(&vol);
     launch_args.arg(&alpha);
 
-    launch_args.arg(&n_real);
-
-    unsafe { launch_args.launch(cfg) }.unwrap();
-}
-
-/// See notes on the CPU equivalent.
-fn energy_half_spectrum(
-    stream: &Arc<CudaStream>,
-    kernel: &CudaFunction,
-    rho_cplx_gpu: &mut CudaSlice<f32>,
-    out_partial_gpu: &mut CudaSlice<f64>,
-    tables: &GpuTables,
-    plan_dims: (usize, usize, usize),
-    vol: f32,
-    alpha: f32,
-) {
-    let (nx, ny, nz) = plan_dims;
-    let nx_i = nx as i32;
-    let ny_i = ny as i32;
-    let nz_i = nz as i32;
-
-    let n = (nx * ny * (nz / 2 + 1)) as i32;
-
-    // let block: u32 = 256;
-    // let grid: u32 = ((n as u32) + block - 1) / block;
-
-    // let cfg = LaunchConfig::for_num_elems(n as u32);
-    let cfg = launch_cfg(n as u32, 256);
-
-    let mut launch_args = stream.launch_builder(kernel);
-
-    launch_args.arg(rho_cplx_gpu);
-
-    launch_args.arg(&tables.kx);
-
-    launch_args.arg(&tables.ky);
-    launch_args.arg(&tables.kz);
-    launch_args.arg(&tables.bx);
-    launch_args.arg(&tables.by);
-    launch_args.arg(&tables.bz);
-
-    launch_args.arg(&nx_i);
-    launch_args.arg(&ny_i);
-    launch_args.arg(&nz_i);
-
-    launch_args.arg(&vol);
-    launch_args.arg(&alpha);
-
-    launch_args.arg(out_partial_gpu);
+    launch_args.arg(energy_partial);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
@@ -468,9 +504,7 @@ fn gather_forces_to_atoms(
     kernel: &CudaFunction,
     pos_gpu: &CudaSlice<f32>,
     q_gpu: &CudaSlice<f32>,
-    ex_gpu: &CudaSlice<f32>,
-    ey_gpu: &CudaSlice<f32>,
-    ez_gpu: &CudaSlice<f32>,
+    e_gpu: &CudaSlice<f32>,
     out_partial_gpu: &mut CudaSlice<f32>,
     plan_dims: (usize, usize, usize),
     box_dims: (f32, f32, f32),
@@ -481,6 +515,9 @@ fn gather_forces_to_atoms(
     let nz_i = nz as i32;
 
     let (lx, ly, lz) = box_dims;
+    let grid_x = nx as f32 / lx;
+    let grid_y = ny as f32 / ly;
+    let grid_z = nz as f32 / lz;
 
     let n = pos_gpu.len() / 3;
     let n_u32 = n as u32;
@@ -492,9 +529,7 @@ fn gather_forces_to_atoms(
 
     launch_args.arg(pos_gpu);
 
-    launch_args.arg(ex_gpu);
-    launch_args.arg(ey_gpu);
-    launch_args.arg(ez_gpu);
+    launch_args.arg(e_gpu);
     launch_args.arg(q_gpu);
 
     launch_args.arg(out_partial_gpu);
@@ -504,9 +539,9 @@ fn gather_forces_to_atoms(
     launch_args.arg(&nx_i);
     launch_args.arg(&ny_i);
     launch_args.arg(&nz_i);
-    launch_args.arg(&lx);
-    launch_args.arg(&ly);
-    launch_args.arg(&lz);
+    launch_args.arg(&grid_x);
+    launch_args.arg(&grid_y);
+    launch_args.arg(&grid_z);
 
     unsafe { launch_args.launch(cfg) }.unwrap();
 }
