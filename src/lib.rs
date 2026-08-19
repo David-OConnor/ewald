@@ -41,6 +41,25 @@ use crate::gpu_shared::{GpuData, GpuTables, Kernels};
 #[cfg(feature = "cuda")]
 const PTX: &str = include_str!("../ewald.ptx");
 
+/// Whether the GPU FFT backend is usable on *this* machine, as opposed to merely compiled in.
+///
+/// With the `cufft` backend the library is loaded at runtime (see `src/cuda/cufft.cu`), so a binary
+/// built with CUDA support still runs where CUDA is not installed. Check this alongside the CUDA
+/// driver's own availability before selecting a GPU compute device; SPME's reciprocal-space step
+/// has no GPU path without it.
+#[cfg(feature = "cuda")]
+pub fn gpu_fft_available() -> bool {
+    #[cfg(feature = "cufft")]
+    {
+        unsafe { fft::gpu_fft_available() != 0 }
+    }
+    // vkFFT is compiled into the binary rather than loaded from a shared library.
+    #[cfg(not(feature = "cufft"))]
+    {
+        true
+    }
+}
+
 const SQRT_PI: f32 = 1.7724538509055159;
 const INV_SQRT_PI: f32 = 1. / SQRT_PI;
 const TWO_INV_SQRT_PI: f32 = 2. / SQRT_PI;
@@ -141,14 +160,24 @@ impl PmeRecip {
 
                     #[cfg(feature = "cuda")]
                     let planner_gpu = fft::create_gpu_plan(plan_dims, s);
-                    let workspace = gpu_shared::GpuWorkspace::new(plan_dims, s);
 
-                    Some(GpuData {
-                        planner_gpu,
-                        gpu_tables,
-                        kernels,
-                        workspace,
-                    })
+                    // A null plan means the FFT library could not be loaded. Rather than run the
+                    // GPU path against a plan that would silently do nothing, drop back to the CPU.
+                    if planner_gpu.is_null() {
+                        eprintln!(
+                            "Unable to create a GPU FFT plan; using the CPU for SPME reciprocal space."
+                        );
+                        None
+                    } else {
+                        let workspace = gpu_shared::GpuWorkspace::new(plan_dims, s);
+
+                        Some(GpuData {
+                            planner_gpu,
+                            gpu_tables,
+                            kernels,
+                            workspace,
+                        })
+                    }
                 }
                 Err(_) => None,
             };

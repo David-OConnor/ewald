@@ -236,6 +236,13 @@ pub(crate) fn fft3d_c2r_into(
 //     let ez = stream.memcpy_dtov(&ez_dev).unwrap();
 // }
 
+// Reports whether the cuFFT shared library could be loaded. It is looked up at runtime rather than
+// linked, so that a `cufft`-enabled binary still starts where CUDA is absent; see `cufft.cu`.
+#[cfg(feature = "cufft")]
+unsafe extern "C" {
+    pub(crate) fn gpu_fft_available() -> i32;
+}
+
 #[cfg(feature = "cuda")]
 // FFI for GPU FFT functions. These signatures are the same for cuFFT and vkFFT, so we use
 // them for both.

@@ -31,10 +31,14 @@ realfft = "3.5.0"
 
 rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
 
-#[target.'cfg(not(target_os = "windows"))'.dependencies]
-cudarc = { version = "0.19.0", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13000"], optional=true }
-#[target.'cfg(target_os = "windows")'.dependencies]
-#cudarc = { version = "0.18.1", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13000"], optional=true }
+# `dynamic-loading` (rather than `dynamic-linking`) is deliberate: it makes the CUDA driver library
+# a `dlopen`/`LoadLibrary` lookup at first use instead of a load-time dependency of the executable.
+# A binary built with the `cuda` feature therefore still starts on machines with no NVIDIA driver;
+# callers check `cudarc::driver::sys::is_culib_present()` and fall back to the CPU path.
+# Note that cudarc's build script rejects `dynamic-loading` and `dynamic-linking` being active at
+# once, and Cargo unions features across crates: every crate in the tree that depends on cudarc
+# (here, `dynamics`, `molchanica`) must agree on this.
+cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional=true }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.9", optional = true }
