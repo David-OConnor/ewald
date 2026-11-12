@@ -1,6 +1,6 @@
 [package]
 name = "ewald"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 authors = ["David O'Connor <the_alchemist@fastmail.com>"]
 description = "Ewald SPME force calculations"
@@ -23,13 +23,13 @@ exclude = [".gitignore"]
 lin_alg = "1.4.3"
 # We use this to get the erf error function for use in the Ewald approximation in MD
 # todo: Way to avoid this dep for something lighter?
-statrs = "0.18.0"
+statrs = "0.19"
 
 # `realfft` is an augmentation that allows for R2C and C2R functionality.
-rustfft = "6.4.1"
-realfft = "3.5.0"
+rustfft = "6.4"
+realfft = "3.5"
 
-rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
+rayon = "1.12"  # Parallel execution on CPU using thread pools.
 
 # `dynamic-loading` (rather than `dynamic-linking`) is deliberate: it makes the CUDA driver library
 # a `dlopen`/`LoadLibrary` lookup at first use instead of a load-time dependency of the executable.
@@ -38,7 +38,7 @@ rayon = "1.11.0"  # Parallel execution on CPU using thread pools.
 # Note that cudarc's build script rejects `dynamic-loading` and `dynamic-linking` being active at
 # once, and Cargo unions features across crates: every crate in the tree that depends on cudarc
 # (here, `dynamics`, `molchanica`) must agree on this.
-cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional=true }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional=true }
 
 [build-dependencies]
 cuda_setup = { version = "0.1.9", optional = true }
