@@ -41,7 +41,7 @@ rayon = "1.12"  # Parallel execution on CPU using thread pools.
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional=true }
 
 [build-dependencies]
-cuda_setup = { version = "0.1.9", optional = true }
+cuda_setup = { version = "0.1.10", optional = true }
 cc = "1.2.47"
 
 
