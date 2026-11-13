@@ -17,10 +17,7 @@ use std::f32::consts::TAU;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use cudarc::{
-    driver::{CudaContext, CudaStream},
-    nvrtc::Ptx,
-};
+use cudarc::{driver::CudaStream, nvrtc::Ptx};
 
 mod fft;
 
@@ -129,63 +126,32 @@ impl PmeRecip {
         let bmod_sq_inv_z = spline_bmod_sq_inv_1d(plan_dims.2, SPLINE_ORDER);
 
         #[cfg(feature = "cuda")]
-        let mut gpu_data = None;
-
-        #[cfg(feature = "cuda")]
-        if let Some(s) = stream {
-            gpu_data = match CudaContext::new(0) {
-                Ok(cuda_ctx) => {
-                    let kernels = {
-                        let module = cuda_ctx.load_module(Ptx::from_src(PTX)).unwrap();
-
-                        let kernel_spread = module.load_function("spread_charges").unwrap();
-                        let kernel_ghat = module.load_function("apply_ghat_and_grad").unwrap();
-                        // let kernel_ghat = module.load_function("apply_ghat_and_compute_potential").unwrap();
-                        let kernel_gather = module.load_function("gather_forces_to_atoms").unwrap();
-                        Kernels {
-                            kernel_spread,
-                            kernel_ghat,
-                            kernel_gather,
-                        }
-                    };
-
-                    let gpu_tables = {
-                        let k = (&kx, &ky, &kz);
-                        let bmod2 = (&bmod_sq_inv_x, &bmod_sq_inv_y, &bmod_sq_inv_z);
-
-                        GpuTables::new(k, bmod2, s)
-                    };
-
-                    // let planner_gpu = cufft::create_gpu_plan(plan_dims, s);
-
-                    #[cfg(feature = "cuda")]
-                    let planner_gpu = fft::create_gpu_plan(plan_dims, s);
-
-                    // A null plan means the FFT library could not be loaded. Rather than run the
-                    // GPU path against a plan that would silently do nothing, drop back to the CPU.
-                    if planner_gpu.is_null() {
-                        eprintln!(
-                            "Unable to create a GPU FFT plan; using the CPU for SPME reciprocal space."
-                        );
-                        None
-                    } else {
-                        let workspace = gpu_shared::GpuWorkspace::new(plan_dims, s);
-
-                        Some(GpuData {
-                            planner_gpu,
-                            gpu_tables,
-                            kernels,
-                            workspace,
-                        })
-                    }
-                }
-                Err(_) => None,
+        let gpu_data = stream.and_then(|s| {
+            let module = s.context().load_module(Ptx::from_src(PTX)).ok()?;
+            let kernels = Kernels {
+                kernel_spread: module.load_function("spread_charges").ok()?,
+                kernel_ghat: module.load_function("apply_ghat_and_grad").ok()?,
+                kernel_gather: module.load_function("gather_forces_to_atoms").ok()?,
             };
-        }
+            let planner_gpu = fft::create_gpu_plan(plan_dims, s);
+            if planner_gpu.is_null() {
+                eprintln!("Unable to create GPU FFT plan; using CPU SPME.");
 
-        // Note: planner_gpu and gpu_tables will be null/None until the first run. We
-        // handle it this way since the forces fns have access to the stream or Context,
-        // but this construct doens't, if we keep a unified constructor.
+                return None;
+            }
+
+            Some(GpuData {
+                planner_gpu,
+                gpu_tables: GpuTables::new(
+                    (&kx, &ky, &kz),
+                    (&bmod_sq_inv_x, &bmod_sq_inv_y, &bmod_sq_inv_z),
+                    s,
+                ),
+                kernels,
+                workspace: gpu_shared::GpuWorkspace::new(plan_dims, s),
+            })
+        });
+
         Self {
             box_dims: l,
             plan_dims,
@@ -205,7 +171,12 @@ impl PmeRecip {
         }
     }
 
-    /// CPU charge spreading. Z as the fast/contiguous axis.
+    /// Whether GPU reciprocal-space initialization succeeded.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_ready(&self) -> bool {
+        self.gpu_data.is_some()
+    }
+
     /// We place charges on a discrete grid, then apply a 3D FFT to the grid.
     fn spread_charges(&self, pos: &[Vec3], q: &[f32], rho: &mut [f32]) {
         let (nx, ny, nz) = self.plan_dims;
@@ -320,6 +291,7 @@ impl PmeRecip {
 
         let (vol, alpha) = (self.vol, self.alpha);
         let two_alpha_sq = 2.0 * (alpha as f64) * (alpha as f64);
+        let odd_z = self.plan_dims.2 % 2 != 0;
 
         let (energy_sum, virial_sum): (f64, f64) = phi_k
             .par_iter_mut()
@@ -361,7 +333,7 @@ impl PmeRecip {
                 let mut local_energy =
                     rho_val.re as f64 * val.re as f64 + rho_val.im as f64 * val.im as f64;
 
-                if izc > 0 && izc < (nzc - 1) {
+                if izc > 0 && (odd_z || izc < nzc - 1) {
                     local_energy *= 2.0;
                 }
 
@@ -698,7 +670,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn test_gpu_reciprocal_matches_cpu_energy_and_force_direction() {
-        let ctx = CudaContext::new(0).unwrap();
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
         let dims = (24, 24, 24);
         let box_dims = (24.0, 24.0, 24.0);

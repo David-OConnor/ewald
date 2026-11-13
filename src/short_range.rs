@@ -1,10 +1,6 @@
 //! This module contains code for the short-range component of the Coulomb force.
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_CMP_LT_OQ, _mm256_blendv_ps, _mm256_cmp_ps, _mm256_set1_ps};
-
 use lin_alg::f32::Vec3;
-#[cfg(target_arch = "x86_64")]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
 use statrs::function::erf::erfc;
 
@@ -45,7 +41,7 @@ pub fn force_coulomb_short_range(
     (dir * force_mag, energy)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[inline]
 pub fn force_coulomb_short_range_x8(
     dir: Vec3x8,
     dist: f32x8,
@@ -57,7 +53,7 @@ pub fn force_coulomb_short_range_x8(
     α: f32x8,
 ) -> (Vec3x8, f32x8) {
     let α_r = α * dist;
-    let erfc_term = α_r.erfc();
+    let erfc_term = f32x8::from_array(α_r.to_array().map(|x| erfc(x as f64) as f32));
 
     let charge_term = q_0 * q_1;
 
@@ -71,30 +67,20 @@ pub fn force_coulomb_short_range_x8(
 
     let force = dir * force_mag;
 
-    // This is where we diverge from the syntax of the non-SIMD variant;
-    // the outside/inside cutoff.
-    // per-lane mask: keep where dist < cutoff_dist, else zero
-    unsafe {
-        let keep = _mm256_cmp_ps::<{ _CMP_LT_OQ }>(dist.0, cutoff_dist.0);
-        let zero = _mm256_set1_ps(0.0);
+    let keep = dist.lt(cutoff_dist);
+    let zero = f32x8::splat(0.);
 
-        let fx = _mm256_blendv_ps(zero, (force.x).0, keep);
-        let fy = _mm256_blendv_ps(zero, (force.y).0, keep);
-        let fz = _mm256_blendv_ps(zero, (force.z).0, keep);
-        let en = _mm256_blendv_ps(zero, energy.0, keep);
-
-        (
-            Vec3x8 {
-                x: f32x8(fx),
-                y: f32x8(fy),
-                z: f32x8(fz),
-            },
-            f32x8(en),
-        )
-    }
+    (
+        Vec3x8 {
+            x: keep.select(force.x, zero),
+            y: keep.select(force.y, zero),
+            z: keep.select(force.z, zero),
+        },
+        keep.select(energy, zero),
+    )
 }
 
-#[cfg(target_arch = "x86_64")]
+#[inline]
 pub fn force_coulomb_short_range_x16(
     dir: Vec3x16,
     dist: f32x16,
@@ -107,7 +93,7 @@ pub fn force_coulomb_short_range_x16(
     α: f32x16,
 ) -> (Vec3x16, f32x16) {
     let α_r = α * dist;
-    let erfc_term = α_r.erfc();
+    let erfc_term = f32x16::from_array(α_r.to_array().map(|x| erfc(x as f64) as f32));
 
     let charge_term = q_0 * q_1;
 
@@ -121,25 +107,15 @@ pub fn force_coulomb_short_range_x16(
 
     let force = dir * force_mag;
 
-    // This is where we diverge from the syntax of the non-SIMD variant;
-    // the outside/inside cutoff.
-    // per-lane mask: keep where dist < cutoff_dist, else zero
-    unsafe {
-        use core::arch::x86_64::*;
-        let keep: __mmask16 = _mm512_cmp_ps_mask::<{ _CMP_LT_OQ }>(dist.0, cutoff_dist.0);
+    let keep = dist.lt(cutoff_dist);
+    let zero = f32x16::splat(0.);
 
-        let fx = _mm512_maskz_mov_ps(keep, (force.x).0);
-        let fy = _mm512_maskz_mov_ps(keep, (force.y).0);
-        let fz = _mm512_maskz_mov_ps(keep, (force.z).0);
-        let en = _mm512_maskz_mov_ps(keep, energy.0);
-
-        (
-            Vec3x16 {
-                x: f32x16(fx),
-                y: f32x16(fy),
-                z: f32x16(fz),
-            },
-            f32x16(en),
-        )
-    }
+    (
+        Vec3x16 {
+            x: keep.select(force.x, zero),
+            y: keep.select(force.y, zero),
+            z: keep.select(force.z, zero),
+        },
+        keep.select(energy, zero),
+    )
 }

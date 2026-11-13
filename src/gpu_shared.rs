@@ -126,8 +126,8 @@ impl GpuWorkspace {
             rho: stream.alloc_zeros(2 * n_cplx).unwrap(),
             ek: stream.alloc_zeros(3 * 2 * n_cplx).unwrap(),
             e: stream.alloc_zeros(3 * n_real).unwrap(),
-            energy_partial: stream.alloc_zeros(energy_blocks).unwrap(),
-            energy_host: PinnedBuffer::new(stream, energy_blocks),
+            energy_partial: stream.alloc_zeros(2 * energy_blocks).unwrap(),
+            energy_host: PinnedBuffer::new(stream, 2 * energy_blocks),
             atoms: None,
         }
     }
@@ -189,13 +189,25 @@ impl PmeRecip {
         posits: &[Vec3],
         q: &[f32],
     ) -> (Vec<Vec3>, f32) {
+        let (forces, energy, _) = self.forces_and_virial_gpu(stream, posits, q);
+
+        (forces, energy)
+    }
+
+    /// GPU reciprocal forces, energy and isotropic virial; falls back to CPU.
+    pub fn forces_and_virial_gpu(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        posits: &[Vec3],
+        q: &[f32],
+    ) -> (Vec<Vec3>, f32, f64) {
         let Some(data) = &mut self.gpu_data else {
-            panic!("Error: Computing forces on GPU without having initialized on GPU");
+            return self.forces_and_virial(posits, q);
         };
 
         assert_eq!(posits.len(), q.len());
         if posits.is_empty() {
-            return (Vec::new(), 0.0);
+            return (Vec::new(), 0.0, 0.0);
         }
 
         data.workspace.ensure_atoms(posits.len(), stream);
@@ -365,7 +377,8 @@ impl PmeRecip {
             .unwrap();
         stream.synchronize().unwrap();
         let f_host = atoms.force_host.as_slice();
-        let reciprocal_energy: f64 = energy_host.as_slice().iter().sum();
+        let reciprocal_energy: f64 = energy_host.as_slice().iter().step_by(2).sum();
+        let virial: f64 = energy_host.as_slice().iter().skip(1).step_by(2).sum();
         let energy = (reciprocal_energy + self_energy(q, self.alpha)) as f32;
 
         // todo: QC the - sign?
@@ -378,7 +391,7 @@ impl PmeRecip {
             });
         }
 
-        (f, energy)
+        (f, energy, virial)
     }
 }
 

@@ -49,3 +49,6 @@ cc = "1.2.47"
 cuda = ["cuda_setup", "cudarc", "lin_alg/cuda"]
 cufft = ["cuda"]
 vkfft = ["cuda"]
+
+[patch.crates-io]
+lin_alg = { path = "../../lin_alg" }

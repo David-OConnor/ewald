@@ -128,6 +128,7 @@ void apply_ghat_and_grad(
     float2* eyk = ek + n_cmplx;
     float2* ezk = ek + 2 * n_cmplx;
     double energy = 0.0;
+    double virial = 0.0;
 
     // Every thread must reach the block reduction below, including padding threads.
     if (idx < n_cmplx) {
@@ -158,29 +159,40 @@ void apply_ghat_and_grad(
             ezk[idx] = make_float2(-kzv * phi_k_im, kzv * phi_k_real);
 
             // Interior z modes represent both members of a conjugate pair.
-            double weight = (iz > 0 && iz < nzc - 1) ? 2.0 : 1.0;
+            double weight = (iz > 0 && (nz % 2 != 0 || iz < nzc - 1)) ? 2.0 : 1.0;
             energy = weight * 0.5 *
                 ((double)rho_v.x * (double)phi_k_real +
                  (double)rho_v.y * (double)phi_k_im);
+            virial = energy * (1.0 - (double)k2 / (2.0 * alpha * alpha));
         }
     }
 
     // Reduce energy while G(k) and rho are already resident; this avoids a second
     // full-grid kernel that used to recompute exp(), k², and the deconvolution.
     __shared__ double warp_sums[32];
+    __shared__ double virial_sums[32];
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
         energy += __shfl_down_sync(0xffffffff, energy, offset);
+        virial += __shfl_down_sync(0xffffffff, virial, offset);
     }
-    if (lane == 0) warp_sums[warp] = energy;
+    if (lane == 0) {
+        warp_sums[warp] = energy;
+        virial_sums[warp] = virial;
+    }
     __syncthreads();
     energy = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0;
+    virial = (threadIdx.x < (blockDim.x + 31) / 32) ? virial_sums[lane] : 0.0;
     if (warp == 0) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             energy += __shfl_down_sync(0xffffffff, energy, offset);
+            virial += __shfl_down_sync(0xffffffff, virial, offset);
         }
-        if (lane == 0) energy_partial[blockIdx.x] = energy;
+        if (lane == 0) {
+            energy_partial[2 * blockIdx.x] = energy;
+            energy_partial[2 * blockIdx.x + 1] = virial;
+        }
     }
 
 
@@ -385,7 +397,7 @@ void energy_half_spectrum(
         // 1/2 * Re{ rho*(k) * phi(k) } = 1/2 * (a*phi_re + b*phi_im)
         // Interior z-modes (0 < iz < nzc-1) each represent two modes in the full
         // spectrum (k and its conjugate -k), so they must be counted twice.
-        double weight = (iz > 0 && iz < nzc - 1) ? 2.0 : 1.0;
+        double weight = (iz > 0 && (nz % 2 != 0 || iz < nzc - 1)) ? 2.0 : 1.0;
         acc += weight * 0.5 * (a*phi_re + b*phi_im);
     }
 

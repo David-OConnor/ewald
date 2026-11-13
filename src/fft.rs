@@ -5,6 +5,7 @@ use std::{ffi::c_void, sync::Arc};
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
+use rayon::prelude::*;
 use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 
@@ -56,54 +57,18 @@ pub(crate) fn fft3d_r2c_into(
     let fft_x = planner.plan_fft_forward(nx);
 
     out.resize(n_cplx, Complex_::new(0.0, 0.0));
-    let mut scratch_z = r2c_z.make_scratch_vec();
-
-    // Z: R2C rows (contiguous)
-    for ix in 0..nx {
-        for iy in 0..ny {
-            let row_r = ix * (ny * nz) + iy * nz;
-            let row_k = ix * (ny * nzc) + iy * nzc;
-            let in_row = &mut data_r[row_r..row_r + nz];
-            let out_row = &mut out[row_k..row_k + nzc];
-            r2c_z
-                .process_with_scratch(in_row, out_row, &mut scratch_z)
-                .unwrap();
-        }
-    }
-
-    // Y: C2C columns
-    {
-        let mut tmp = vec![Complex_::new(0.0, 0.0); ny];
-        let mut scratch = vec![Complex_::new(0.0, 0.0); fft_y.get_inplace_scratch_len()];
-        for ix in 0..nx {
-            for izc in 0..nzc {
-                for (j, iy) in (0..ny).enumerate() {
-                    tmp[j] = out[ix * (ny * nzc) + iy * nzc + izc];
-                }
-                fft_y.process_with_scratch(&mut tmp, &mut scratch);
-                for (j, iy) in (0..ny).enumerate() {
-                    out[ix * (ny * nzc) + iy * nzc + izc] = tmp[j];
-                }
-            }
-        }
-    }
-
-    // X: C2C columns (most strided)
-    {
-        let mut tmp = vec![Complex_::new(0.0, 0.0); nx];
-        let mut scratch = vec![Complex_::new(0.0, 0.0); fft_x.get_inplace_scratch_len()];
-        for iy in 0..ny {
-            for izc in 0..nzc {
-                for (k, ix) in (0..nx).enumerate() {
-                    tmp[k] = out[ix * (ny * nzc) + iy * nzc + izc];
-                }
-                fft_x.process_with_scratch(&mut tmp, &mut scratch);
-                for (k, ix) in (0..nx).enumerate() {
-                    out[ix * (ny * nzc) + iy * nzc + izc] = tmp[k];
-                }
-            }
-        }
-    }
+    data_r
+        .par_chunks_mut(nz)
+        .zip(out.par_chunks_mut(nzc))
+        .with_min_len(16)
+        .for_each_init(
+            || r2c_z.make_scratch_vec(),
+            |scratch, (input, output)| {
+                r2c_z.process_with_scratch(input, output, scratch).unwrap();
+            },
+        );
+    transform_y(out, nx, ny, nzc, &fft_y);
+    transform_x(out, nx, ny, nzc, &fft_x);
 }
 
 /// Complex-to-real inverse 3D FFT.
@@ -146,62 +111,81 @@ pub(crate) fn fft3d_c2r_into(
     let ifft_y = planner.plan_fft_inverse(ny);
     let ifft_x = planner.plan_fft_inverse(nx);
 
-    // inverse X: C2C
-    {
-        let mut tmp = vec![Complex_::new(0.0, 0.0); nx];
-        let mut scratch = vec![Complex_::new(0.0, 0.0); ifft_x.get_inplace_scratch_len()];
-        for iy in 0..ny {
-            for izc in 0..nzc {
-                for (k, ix) in (0..nx).enumerate() {
-                    tmp[k] = data_k[ix * (ny * nzc) + iy * nzc + izc];
-                }
-                ifft_x.process_with_scratch(&mut tmp, &mut scratch);
-                for (k, ix) in (0..nx).enumerate() {
-                    data_k[ix * (ny * nzc) + iy * nzc + izc] = tmp[k];
-                }
-            }
-        }
-    }
+    transform_x(data_k, nx, ny, nzc, &ifft_x);
+    transform_y(data_k, nx, ny, nzc, &ifft_y);
 
-    // inverse Y: C2C
-    {
-        let mut tmp = vec![Complex_::new(0.0, 0.0); ny];
-        let mut scratch = vec![Complex_::new(0.0, 0.0); ifft_y.get_inplace_scratch_len()];
-
-        for ix in 0..nx {
-            for izc in 0..nzc {
-                for (j, iy) in (0..ny).enumerate() {
-                    tmp[j] = data_k[ix * (ny * nzc) + iy * nzc + izc];
-                }
-                ifft_y.process_with_scratch(&mut tmp, &mut scratch);
-                for (j, iy) in (0..ny).enumerate() {
-                    data_k[ix * (ny * nzc) + iy * nzc + izc] = tmp[j];
-                }
-            }
-        }
-    }
-
-    // Z: C2R rows (contiguous)
     out.resize(nx * ny * nz, 0.0);
-    let mut scratch_z = c2r_z.make_scratch_vec();
-    for ix in 0..nx {
-        for iy in 0..ny {
-            let row_k = ix * (ny * nzc) + iy * nzc;
-            let row_r = ix * (ny * nz) + iy * nz;
-            let in_row = &mut data_k[row_k..row_k + nzc];
-            let out_row = &mut out[row_r..row_r + nz];
+    data_k
+        .par_chunks_mut(nzc)
+        .zip(out.par_chunks_mut(nz))
+        .with_min_len(16)
+        .for_each_init(
+            || c2r_z.make_scratch_vec(),
+            |scratch, (input, output)| {
+                input[0].im = 0.0;
+                if nz % 2 == 0 {
+                    input[nzc - 1].im = 0.0;
+                }
 
-            // Enforce real-signal constraint at DC / Nyquist along Z
-            in_row[0].im = 0.0;
-            if nz % 2 == 0 {
-                in_row[nzc - 1].im = 0.0;
+                c2r_z.process_with_scratch(input, output, scratch).unwrap();
+            },
+        );
+}
+
+fn transform_y(
+    data: &mut [Complex_],
+    nx: usize,
+    ny: usize,
+    nzc: usize,
+    fft: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+) {
+    assert_eq!(data.len(), nx * ny * nzc);
+    data.par_chunks_mut(ny * nzc).for_each_init(
+        || {
+            (
+                vec![Complex_::default(); ny],
+                vec![Complex_::default(); fft.get_inplace_scratch_len()],
+            )
+        },
+        |(column, scratch), plane| {
+            for z in 0..nzc {
+                for y in 0..ny {
+                    column[y] = plane[y * nzc + z];
+                }
+                fft.process_with_scratch(column, scratch);
+                for y in 0..ny {
+                    plane[y * nzc + z] = column[y];
+                }
             }
+        },
+    );
+}
 
-            c2r_z
-                .process_with_scratch(in_row, out_row, &mut scratch_z)
-                .unwrap();
-        }
-    }
+fn transform_x(
+    data: &mut [Complex_],
+    nx: usize,
+    ny: usize,
+    nzc: usize,
+    fft: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+) {
+    let stride = ny * nzc;
+    let mut columns = vec![Complex_::default(); data.len()];
+    columns.par_chunks_mut(nx).enumerate().for_each_init(
+        || vec![Complex_::default(); fft.get_inplace_scratch_len()],
+        |scratch, (yz, column)| {
+            for x in 0..nx {
+                column[x] = data[x * stride + yz];
+            }
+            fft.process_with_scratch(column, scratch);
+        },
+    );
+    data.par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(x, plane)| {
+            for yz in 0..stride {
+                plane[yz] = columns[yz * nx + x];
+            }
+        });
 }
 
 // // todo: Experimenting
